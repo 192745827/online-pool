@@ -55,7 +55,7 @@ function rack({ tableW }) {
 
 function init(match) {
   match.phase = 'break';
-  match.message = `${match.players[0].name} to break.`;
+  match.message = `${match.players[0].name} 开球。`;
 }
 
 // The legal target is the lowest ball on the table at the moment of the shot.
@@ -80,7 +80,7 @@ function over(match, winnerIdx, why) {
   return {
     gameOver: true,
     winner: winnerIdx,
-    message: `${match.players[winnerIdx].name} wins — ${why}.`,
+    message: `${match.players[winnerIdx].name} 获胜 — ${why}。`,
   };
 }
 
@@ -95,19 +95,19 @@ function resolve(s, match) {
 
   // ---- Foul detection ----
   let foul = false, reason = '';
-  if (s.cueScratch) { foul = true; reason = 'Scratch (cue ball pocketed)'; }
-  else if (s.firstHit == null) { foul = true; reason = 'No ball contacted'; }
+  if (s.cueScratch) { foul = true; reason = '白球落袋（犯规）'; }
+  else if (s.firstHit == null) { foul = true; reason = '未触球'; }
   else if (!s.isBreak && s.pre.lowest != null && s.firstHit !== s.pre.lowest) {
-    foul = true; reason = `Must hit the ${s.pre.lowest} first`;
+    foul = true; reason = `必须先击中 ${s.pre.lowest} 号球`;
   } else if (!s.railAfterContact && pocketed.length === 0) {
-    foul = true; reason = 'No ball reached a rail';
+    foul = true; reason = '未碰库边';
   } else if (objectOff) {
-    foul = true; reason = 'Drove a ball off the table';
+    foul = true; reason = '球被打出球台';
   }
 
   // Break-specific legality: pocket a ball OR drive ≥4 balls to a rail.
   if (s.isBreak && !foul && pocketed.length === 0 && s.railedBalls.size < 4) {
-    foul = true; reason = 'Illegal break (drive 4+ balls to a rail or pocket one)';
+    foul = true; reason = '非法开球（需让4球碰库或进球）';
   }
 
   // After the break, it's normal rotation play.
@@ -115,19 +115,19 @@ function resolve(s, match) {
 
   // ---- 9-ball win / loss ----
   if (ninePocketed) {
-    if (!foul) return over(match, me, 'sank the 9-ball');
-    return over(match, opp, `${P[me].name} pocketed the 9-ball on a foul`);
+    if (!foul) return over(match, me, '打进9号球');
+    return over(match, opp, `${P[me].name} 犯规打进9号球`);
   }
 
   // ---- Fouls: pass turn + ball in hand ----
   if (foul) {
-    return { foul: true, reason, message: `${reason}. Ball in hand for ${P[opp].name}.` };
+    return { foul: true, reason, message: `${reason}。${P[opp].name} 获得手中球。` };
   }
 
   // ---- No foul: pocketing any ball keeps the shooter at the table. ----
   const continues = pocketed.length > 0;
-  if (continues) return { continues: true, message: `${P[me].name} continues.` };
-  return { continues: false, message: `${P[opp].name}'s turn.` };
+  if (continues) return { continues: true, message: `${P[me].name} 继续击球。` };
+  return { continues: false, message: `轮到 ${P[opp].name}。` };
 }
 
 function hud(match) {
@@ -139,13 +139,13 @@ function hud(match) {
     });
   }
   const low = lowestOnTable(match);
-  const status = match.phase === 'break' ? 'Break shot'
-    : match.phase === 'over' ? 'Game over'
-    : low != null ? `Rotation — hit the ${low} first` : 'Rotation';
+  const status = match.phase === 'break' ? '开球'
+    : match.phase === 'over' ? '游戏结束'
+    : low != null ? `顺序击球 — 先打 ${low} 号` : '顺序击球';
   return { chips, status };
 }
 
 export const nineBall = {
-  meta: { id: '9ball', name: '9-Ball' },
+  meta: { id: '9ball', name: '9球' },
   rack, init, snapshot, resolve, hud, legalTargets,
 };
