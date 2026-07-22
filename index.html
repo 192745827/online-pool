@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>Online Pool — 8-Ball / 9-Ball</title>
+  <title>在线台球 — 8球 / 9球</title>
   <link rel="stylesheet" href="./styles.css" />
   <!-- schemapack.js does `import { Buffer } from 'buffer'`; map it to our shim. -->
   <script type="importmap">
@@ -24,55 +24,55 @@
        While it is shown, body.reviewing lifts the other bottom-anchored UI
        clear of it. -->
   <div id="replayBar" class="replayBar hidden">
-    <span class="replayTag">Replay</span>
+    <span class="replayTag">回放</span>
     <span id="replayWhich" class="replayWhich"></span>
-    <button id="replayRestart" title="Restart">⏮</button>
-    <button id="replayStepBack" title="Step back one frame (16 ms)">−16</button>
-    <button id="replayPlay" title="Play / Pause">▶</button>
-    <button id="replayStepFwd" title="Step forward one frame (16 ms)">+16</button>
+    <button id="replayRestart" title="重新开始">⏮</button>
+    <button id="replayStepBack" title="后退一帧 (16 毫秒)">−16</button>
+    <button id="replayPlay" title="播放 / 暂停">▶</button>
+    <button id="replayStepFwd" title="前进一帧 (16 毫秒)">+16</button>
     <input id="replayScrub" class="replayScrub" type="range" min="0" max="1000" value="0" />
-    <span id="replayTime" class="replayTime">0.0 / 0.0s</span>
-    <button id="replayExit" title="Back to live game">✕ Exit</button>
+    <span id="replayTime" class="replayTime">0.0 / 0.0 秒</span>
+    <button id="replayExit" title="返回实时游戏">✕ 退出</button>
   </div>
 
-  <!-- ===== Menu ===== -->
+  <!-- ===== 菜单 ===== -->
   <div id="menu" class="overlay">
     <div class="panel">
-      <h1>Online Pool</h1>
-      <label class="field">Your name
-        <input id="nameInput" type="text" maxlength="16" placeholder="Player" />
+      <h1>在线台球</h1>
+      <label class="field">你的名字
+        <input id="nameInput" type="text" maxlength="16" placeholder="玩家" />
       </label>
-      <label class="field">Game
+      <label class="field">游戏模式
         <select id="gameSelect">
-          <option value="0">8-Ball</option>
-          <option value="1">9-Ball</option>
+          <option value="0">8球</option>
+          <option value="1">9球</option>
         </select>
       </label>
       <div class="btnRow">
-        <button id="btnCreate">Create Room</button>
-        <button id="btnQuick">Quick Play</button>
-        <button id="btnBot">vs Computer</button>
+        <button id="btnCreate">创建房间</button>
+        <button id="btnQuick">快速开始</button>
+        <button id="btnBot">对战电脑</button>
       </div>
-      <div class="divider"><span>or join with a code</span></div>
+      <div class="divider"><span>或使用房间码加入</span></div>
       <div class="btnRow">
-        <input id="codeInput" type="text" maxlength="4" placeholder="CODE" class="codeField" />
-        <button id="btnJoin">Join</button>
+        <input id="codeInput" type="text" maxlength="4" placeholder="房间码" class="codeField" />
+        <button id="btnJoin">加入</button>
       </div>
       <div id="menuMsg" class="menuMsg"></div>
     </div>
   </div>
 
-  <!-- ===== Lobby (waiting) ===== -->
+  <!-- ===== 大厅（等待中） ===== -->
   <div id="lobby" class="overlay hidden">
     <div class="panel">
-      <h1>Waiting for opponent…</h1>
-      <p>Share this room code:</p>
+      <h1>正在等待对手…</h1>
+      <p>分享这个房间码：</p>
       <div id="lobbyCode" class="bigCode">----</div>
-      <button id="btnLeaveLobby">Cancel</button>
+      <button id="btnLeaveLobby">取消</button>
     </div>
   </div>
 
-  <!-- ===== Game (rendered behind the menu overlay until a match starts) ===== -->
+  <!-- ===== 游戏 ===== -->
   <div id="game" class="wrap">
     <div class="stageWrap">
       <canvas id="stage"></canvas>
@@ -83,17 +83,17 @@
 
       <!-- Top-left hamburger: game actions + collapsible replays + instructions -->
       <div id="sideMenu" class="sideMenu collapsed">
-        <button id="menuBtn" class="menuBtn" aria-label="Menu" title="Menu">≡</button>
+        <button id="menuBtn" class="menuBtn" aria-label="菜单" title="菜单">≡</button>
         <div class="sideMenuBody">
           <div class="btnRow">
-            <button id="btnNewGame">New Game</button>
-            <button id="btnLeaveGame">Leave</button>
+            <button id="btnNewGame">新游戏</button>
+            <button id="btnLeaveGame">离开</button>
           </div>
 
           <!-- Collapsible shot-replay player: pick a past shot, then play/pause/
                restart and scrub it like a video (see shotReview.js). -->
           <div id="replayPanel" class="replayPanel collapsed">
-            <button id="replayToggle" class="replayToggle">Replays ▸</button>
+            <button id="replayToggle" class="replayToggle">回放 ▸</button>
             <!-- Only the shot PICKER lives in the menu; the transport controls
                  are in #replayBar at the bottom of the screen, where a video
                  player's controls belong. -->
@@ -104,23 +104,22 @@
 
           <!-- Collapsible instructions -->
           <div id="helpPanel" class="helpPanel collapsed">
-            <button id="helpToggle" class="helpToggle">Instructions ▸</button>
+            <button id="helpToggle" class="helpToggle">操作说明 ▸</button>
             <div class="helpBody">
-              <p><b>Drag</b> on the table to aim (rotate + tilt the view). Click or drag on
-              the <b>spin dial</b> (bottom-left cue-ball face) to set spin (<b>X</b>
-              recenters). To shoot, grab the cue stick over the <b>power bar</b> on the left
-              and drag it <b>down</b> — the tip shows how much power — then release. <b>V</b>
-              swaps between down-the-stick aim and overhead; <b>F</b> toggles the free
-              fly-around view (drag to look, <b>WASD</b> move, <b>Space</b>/<b>Shift</b>
-              up/down).</p>
-              <p>After a foul the other player gets <b>ball in hand</b> (overhead view — move
-              the mouse to position the cue ball, then click to place it).</p>
+              <p><b>拖拽</b>桌面来瞄准（旋转 + 倾斜视角）。点击或拖拽
+              <b>旋转拨盘</b>（左下角母球面）设置旋转（<b>X</b> 键重置）。
+              要击球，在左侧<b>力量条</b>上抓住球杆并<b>向下</b>拖动 —— 杆头显示力度大小 —— 然后释放。<b>V</b>
+              键在瞄准视角和俯视图之间切换；<b>F</b> 键切换自由飞行视角
+              （拖拽观看，<b>WASD</b> 移动，<b>Space</b>/<b>Shift</b>
+              上下移动）。</p>
+              <p>犯规后对方获得<b>手中球</b>（俯视图 —— 移动
+              鼠标定位母球，然后点击放置）。</p>
             </div>
           </div>
 
           <!-- Bot games only: opponent difficulty -->
           <div id="botSkillWrap" class="hidden">
-            <span>Difficulty</span>
+            <span>难度</span>
             <input id="botSkillSlider" type="range" min="0" max="100" value="50" />
           </div>
         </div>
@@ -134,33 +133,33 @@
       </div>
 
       <!-- Ball-in-hand: appears next to the cue ball; tap to place it there. -->
-      <button id="placeConfirm" class="placeConfirm hidden" title="Place the ball here" aria-label="Place ball">✓</button>
+      <button id="placeConfirm" class="placeConfirm hidden" title="在此放置母球" aria-label="放置母球">✓</button>
 
       <!-- Bottom-left camera buttons, one per key: swap aim ↔ overhead (V, icon
            shows the view it will take you to) and free-cam on/off (F). -->
       <div id="viewBtns" class="viewBtns">
-        <button id="viewBtn" class="viewBtn" title="Change view">⬇️</button>
-        <button id="freeBtn" class="viewBtn" title="Free camera">🎥</button>
+        <button id="viewBtn" class="viewBtn" title="切换视角">⬇️</button>
+        <button id="freeBtn" class="viewBtn" title="自由相机">🎥</button>
       </div>
 
       <!-- Bottom-right touch controls. Zoom shows in aim / overhead; the movement
            pad shows in free-fly. main.js toggles them by view. -->
       <div id="zoomControls" class="ctrlCluster hidden">
-        <button id="zoomIn" class="ctrlBtn" aria-label="Zoom in">＋</button>
-        <button id="zoomOut" class="ctrlBtn" aria-label="Zoom out">－</button>
+        <button id="zoomIn" class="ctrlBtn" aria-label="放大">＋</button>
+        <button id="zoomOut" class="ctrlBtn" aria-label="缩小">－</button>
       </div>
       <div id="freeControls" class="ctrlCluster hidden">
         <div class="dpad">
-          <button id="freeFwd" class="ctrlBtn" aria-label="Forward">↑</button>
+          <button id="freeFwd" class="ctrlBtn" aria-label="向前">↑</button>
           <div class="dpadRow">
-            <button id="freeLeft" class="ctrlBtn" aria-label="Left">←</button>
-            <button id="freeRight" class="ctrlBtn" aria-label="Right">→</button>
+            <button id="freeLeft" class="ctrlBtn" aria-label="向左">←</button>
+            <button id="freeRight" class="ctrlBtn" aria-label="向右">→</button>
           </div>
-          <button id="freeBack" class="ctrlBtn" aria-label="Back">↓</button>
+          <button id="freeBack" class="ctrlBtn" aria-label="向后">↓</button>
         </div>
         <div class="updown">
-          <button id="freeUp" class="ctrlBtn" aria-label="Up">⤒</button>
-          <button id="freeDown" class="ctrlBtn" aria-label="Down">⤓</button>
+          <button id="freeUp" class="ctrlBtn" aria-label="向上">⤒</button>
+          <button id="freeDown" class="ctrlBtn" aria-label="向下">⤓</button>
         </div>
       </div>
     </div>
