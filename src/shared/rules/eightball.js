@@ -37,8 +37,8 @@ function countGroupRemaining(match, g) {
 }
 
 function groupLabel(g) {
-  if (g === 'solid') return 'Solids (1-7)';
-  if (g === 'stripe') return 'Stripes (9-15)';
+  if (g === 'solid') return '实色 (1-7)';
+  if (g === 'stripe') return '花色 (9-15)';
   return '—';
 }
 
@@ -85,7 +85,7 @@ function init(match) {
   match.players[0].group = null;
   match.players[1].group = null;
   match.phase = 'break';
-  match.message = `${match.players[0].name} to break.`;
+  match.message = `${match.players[0].name} 开球。`;
 }
 
 // Pre-shot snapshot: legality of a shot depends on the state *before* it, so
@@ -102,7 +102,7 @@ function over(match, winnerIdx, why) {
   return {
     gameOver: true,
     winner: winnerIdx,
-    message: `${match.players[winnerIdx].name} wins — ${why}.`,
+    message: `${match.players[winnerIdx].name} 获胜 — ${why}。`,
   };
 }
 
@@ -138,39 +138,40 @@ function resolve(s, match) {
 
   // ---- Foul detection (any single condition → foul) ----
   let foul = false, reason = '';
-  if (s.cueScratch) { foul = true; reason = 'Scratch (cue ball pocketed)'; }
-  else if (s.firstHit == null) { foul = true; reason = 'No ball contacted'; }
+  if (s.cueScratch) { foul = true; reason = '白球落袋（犯规）'; }
+  else if (s.firstHit == null) { foul = true; reason = '未触球'; }
   else if (!s.railAfterContact && pocketed.length === 0) {
-    foul = true; reason = 'No ball reached a rail';
+    foul = true; reason = '未碰库边';
   } else if (objectOff) {
-    foul = true; reason = 'Drove a ball off the table';
+    foul = true; reason = '球被打出球台';
   } else {
     const fhGroup = groupOf(s.firstHit);
     if (s.isBreak) {
       // Any first contact is legal on the break.
     } else if (match.phase === 'open') {
-      if (fhGroup === 'eight') { foul = true; reason = 'Hit the 8-ball on an open table'; }
+      if (fhGroup === 'eight') { foul = true; reason = '开放台面击中8号球'; }
     } else { // groups assigned ('play')
       if (s.pre.wasOnEight) {
-        if (fhGroup !== 'eight') { foul = true; reason = 'Must hit the 8-ball first'; }
+        if (fhGroup !== 'eight') { foul = true; reason = '必须先击中8号球'; }
       } else if (fhGroup !== myGroup) {
-        foul = true; reason = `Must hit a ${myGroup} first`;
+        const groupName = myGroup === 'solid' ? '实色' : '花色';
+        foul = true; reason = `必须先击中 ${groupName} 球`;
       }
     }
   }
 
   // Break-specific legality: pocket a ball OR drive ≥4 balls to a rail.
   if (s.isBreak && !foul && pocketed.length === 0 && s.railedBalls.size < 4) {
-    foul = true; reason = 'Illegal break (drive 4+ balls to a rail or pocket one)';
+    foul = true; reason = '非法开球（需让4球碰库或进球）';
   }
 
   // ---- 8-ball win / loss ----
   if (eightOff) {
-    return over(match, opp, `${P[me].name} knocked the 8-ball off the table`);
+    return over(match, opp, `${P[me].name} 将8号球打出球台`);
   }
   if (eightPocketed && !s.isBreak) {
-    if (s.pre.wasOnEight && !foul) return over(match, me, 'sank the 8-ball');
-    return over(match, opp, `${P[me].name} pocketed the 8-ball illegally`);
+    if (s.pre.wasOnEight && !foul) return over(match, me, '打进8号球');
+    return over(match, opp, `${P[me].name} 非法打进8号球`);
   }
 
   // ---- Group assignment (open table only, non-break, legal shot) ----
@@ -193,7 +194,7 @@ function resolve(s, match) {
 
   // ---- Fouls: pass turn + ball in hand ----
   if (foul) {
-    return { foul: true, reason, message: `${reason}. Ball in hand for ${P[opp].name}.` };
+    return { foul: true, reason, message: `${reason}。${P[opp].name} 获得手中球。` };
   }
 
   // ---- No foul: does the shooter keep the table? ----
@@ -208,8 +209,8 @@ function resolve(s, match) {
     continues = pocketed.length > 0;
   }
 
-  if (continues) return { continues: true, message: `${P[me].name} continues.` };
-  return { continues: false, message: `${P[opp].name}'s turn.` };
+  if (continues) return { continues: true, message: `${P[me].name} 继续击球。` };
+  return { continues: false, message: `轮到 ${P[opp].name}。` };
 }
 
 function hud(match) {
@@ -219,19 +220,19 @@ function hud(match) {
     const onEight = g && countGroupRemaining(match, g) === 0;
     chips.push({
       text: match.players[i].name +
-        (g ? ` · ${g === 'solid' ? 'Solids' : 'Stripes'}` : '') +
-        (onEight ? ' · on the 8' : ''),
+        (g ? ` · ${g === 'solid' ? '实色' : '花色'}` : '') +
+        (onEight ? ' · 目标8号' : ''),
       active: i === match.current && match.phase !== 'over',
     });
   }
-  const status = match.phase === 'break' ? 'Break shot'
-    : match.phase === 'open' ? 'Table open — groups not yet assigned'
-    : match.phase === 'over' ? 'Game over'
-    : `You: ${groupLabel(match.players[match.current].group)}`;
+  const status = match.phase === 'break' ? '开球'
+    : match.phase === 'open' ? '台面开放 — 尚未分配分组'
+    : match.phase === 'over' ? '游戏结束'
+    : `你的分组: ${groupLabel(match.players[match.current].group)}`;
   return { chips, status };
 }
 
 export const eightBall = {
-  meta: { id: '8ball', name: '8-Ball' },
+  meta: { id: '8ball', name: '8球' },
   rack, init, snapshot, resolve, hud, legalTargets,
 };
