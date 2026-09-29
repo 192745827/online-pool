@@ -2,16 +2,16 @@
 // the table + balls + cue from server state and sends input. All authoritative
 // simulation runs on the server (see server/index.js + src/sim.js).
 import * as THREE from "/lib/three.module.js";
-import { initScene, render, camera } from './scene.js';
+import { initScene, render, camera, graphicsDebug } from './scene.js';
 import {
   tableW, tableH, wireY, rodR, R, cupDepth, cupY, cupR,
-  cabinetRTop, cabinetRBottom, cabinetYTop, cabinetYBottom, cabinetDeckUnderY,
+  cabinetRTop, cabinetRBottom, cabinetYTop, cabinetYBottom,
 } from '../shared/constants.js';
 import { table_top_outline, point_in_outline } from '../shared/table.js';
 import {
   rail_pts, felt_pts, pocket_positions,
   makeTableRails, makePlanarMeshFromPolyline, makeCylindricalCupMesh, makeTableCabinet,
-  makeTableSights,
+  makeTableSights, setClothBlue,
 } from './geometry.js';
 import {
   initCueStick, updateCueAndCamera, updateCueStick, placeCamera,
@@ -21,6 +21,10 @@ import {
   zoomCamera, initFreeCamFromCurrent, resetTopPan,
 } from './cue.js';
 import { bindInput } from './input.js';
+import {
+  QUALITY_LEVELS, getQuality, setQuality, isReverseAim, setReverseAim,
+  isShowFps, setShowFps, setQualityOverride,
+} from './settings.js';
 import {
   buildRack, syncRack, setCuePosition,
   getCueMeshPosition, getObstaclePositions, clearRack, ballIds, sunkNumbers,
@@ -70,7 +74,8 @@ function noteShotWatched(index) {
 }
 
 // ---- Client state -----------------------------------------------------------
-const net = { myIndex: -1, code: '', inGame: false, bot: false, connected: true };  // bot: vs-Computer room
+// watching: spectating the demo table behind the menu (see startWatching)
+const net = { myIndex: -1, code: '', inGame: false, bot: false, connected: true, watching: false };
 let gs = { interact: PH_AIMING, current: 0, ballInHand: false, winner: -1 };  // last gameState
 let prevTurnKey = '';                                   // to detect my-turn transitions
 // opponentAim = the latest streamed target (from `aimState`, ~20 Hz).
@@ -171,14 +176,16 @@ function buildScene() {
   const POCKET_BLACK = 0x141414;   // near-black; true 0 leaves nothing for light to land on
   const PLASTIC = { roughness: 0.35, metalness: 0.0 };
   scene.add(makeTableRails(tableW, tableH, rodR, wireY, { color: POCKET_BLACK, ...PLASTIC }));
-  // Each cup carries its wall up to the deck's underside over the part of its rim
-  // that lies outside the table, so there is no see-through gap under the wire.
+  // Each cup carries its wall up over the part of its rim that lies outside the
+  // table, so there is no see-through gap under the wire. It stops at the BOTTOM
+  // of the wire rod: from there up the rod itself blocks the line of sight, so
+  // any more wall would only be hidden behind it.
   const topOutline = table_top_outline(tableW, tableH);
   for (const [x, z] of pocketPositions) {
     scene.add(makeCylindricalCupMesh(cupR, cupDepth, {
       pos: { x, y: cupY, z },
       color: POCKET_BLACK, ...PLASTIC,
-      raiseTo: cabinetDeckUnderY,
+      raiseTo: wireY - rodR,
       raiseWhere: (px, pz) => !point_in_outline(px, pz, topOutline),
     }));
   }
@@ -230,9 +237,40 @@ function buildScene() {
 // ---- Menu / lobby / game visibility -----------------------------------------
 const $ = (id) => document.getElementById(id);
 function show(el, on) { $(el).classList.toggle('hidden', !on); }
-function showMenu()  { show('menu', true);  show('lobby', false); net.inGame = false; net.bot = false; }
+function showMenu()  { show('menu', true);  show('lobby', false); net.inGame = false; net.bot = false; startWatching(); }
 function showLobby(code) { show('menu', false); show('lobby', true); $('lobbyCode').textContent = code; }
 function showGame()  { show('menu', false); show('lobby', false); net.inGame = true; }
+
+// ---- Menu background: the demo table ----------------------------------------
+// The main menu renders over a live game between two computer players, seen from
+// the overhead view with nothing else on screen.
+//
+// It needs no separate client: the server sends a spectator the SAME packets it
+// sends a player (startGame / balls / gameState / shotAnim / aimState — see the
+// watchDemo handler in server/index.js), and we hold no seat, so myIndex stays
+// -1. myTurn() is therefore never true, which is what keeps every input path,
+// the aim streamer and the ball-in-hand UI dormant without a single extra guard:
+// spectating the demo is the same code as spectating an opponent's turn.
+//
+// The one thing that IS special-cased is the chrome, and it is special-cased in
+// CSS (body.menuBg) rather than here — the HUD DOM keeps updating, it just isn't
+// shown.
+function startWatching() {
+  if (net.inGame) return;
+  net.watching = true;
+  net.myIndex = -1;           // no seat: nothing is ever our turn
+  socket.emit('watchDemo', {});
+}
+// Entering a real room (or a lobby) takes the table over. The server detaches us
+// on its side the moment we ask for a room, so this is only our half: drop the
+// demo's rack and shot log before the real game's startGame builds its own.
+function stopWatching() {
+  if (!net.watching) return;
+  net.watching = false;
+  document.body.classList.remove('menuBg');
+  socket.emit('stopWatch', {});
+  timeline.reset(); clearRack();
+}
 
 // Connection status strip (reconnecting / opponent reconnecting). `text` is a
 // function so the caller can tick a countdown; pass null to clear.
@@ -272,6 +310,77 @@ $('menuBtn').addEventListener('click', () => $('sideMenu').classList.toggle('col
 $('helpToggle').addEventListener('click', () => {
   const collapsed = $('helpPanel').classList.toggle('collapsed');
   $('helpToggle').textContent = collapsed ? 'Instructions ▸' : 'Instructions ▾';
+});
+
+// ---- Options (reverse aim + graphics quality) ---------------------------------
+// The controls only move the stored values; settings.js pushes the change out to
+// the renderer, the textures and the ball art. Both are read back from storage
+// on load, so the widgets have to be seeded from it rather than from the markup.
+$('optionsToggle').addEventListener('click', () => {
+  const collapsed = $('optionsPanel').classList.toggle('collapsed');
+  $('optionsToggle').textContent = collapsed ? 'Options ▸' : 'Options ▾';
+});
+$('reverseAim').checked = isReverseAim();
+$('reverseAim').addEventListener('change', (e) => setReverseAim(e.target.checked));
+
+// ---- FPS meter ----------------------------------------------------------------
+// Averaged over a window rather than shown per frame: 1/dt off a single frame
+// swings by tens of fps on ordinary GC and reads as noise, and rewriting the DOM
+// every frame to display it would itself cost frames.
+//
+// The COUNTING runs whether or not the meter is shown — two adds and a compare,
+// cheaper than the branch that would skip it — so switching it on shows a true
+// number within one window rather than a garbage first reading. tickFps is called
+// from the top of the render loop, ahead of its early returns, so the rate is the
+// real one even sitting in the menu.
+//
+// Declared HERE, above the wiring below that calls showFpsMeter during module
+// evaluation. Down beside the render loop it would still be in its temporal dead
+// zone at that point and throw.
+const fpsMeter = $('fpsMeter');
+const FPS_WINDOW = 500;              // ms averaged per update
+const FPS_GOOD = 55, FPS_OK = 30;    // green / amber / red
+let fpsFrames = 0, fpsSince = 0, fpsShown = -1;
+function tickFps(now) {
+  if (!fpsSince) { fpsSince = now; return; }
+  fpsFrames++;
+  const dt = now - fpsSince;
+  if (dt < FPS_WINDOW) return;
+  const fps = Math.round((fpsFrames * 1000) / dt);
+  fpsFrames = 0; fpsSince = now;
+  if (!isShowFps() || fps === fpsShown) return;   // nothing to redraw
+  fpsShown = fps;
+  fpsMeter.textContent = fps;
+  fpsMeter.className = `fpsMeter ${fps >= FPS_GOOD ? 'good' : fps >= FPS_OK ? 'ok' : 'bad'}`;
+}
+// Hidden by class rather than by stopping the sampling, so the meter shows a real
+// rate the instant it comes back.
+function showFpsMeter(on) {
+  fpsMeter.classList.toggle('hidden', !on);
+  if (!on) fpsShown = -1;   // force a repaint of the value when it returns
+}
+$('showFps').checked = isShowFps();
+showFpsMeter(isShowFps());
+$('showFps').addEventListener('change', (e) => {
+  setShowFps(e.target.checked);
+  showFpsMeter(e.target.checked);
+});
+
+const qualitySlider = $('qualitySlider');
+function showQuality(i) {
+  const level = QUALITY_LEVELS[i];
+  $('qualityName').textContent = level.name;
+  $('qualityBlurb').textContent = level.blurb;
+}
+qualitySlider.value = String(getQuality());
+showQuality(getQuality());
+// 'input', not 'change': the label should track the knob as it is dragged. Each
+// step rebuilds shadow maps and textures, but only on a step — the slider is
+// quantized to the five presets, so a drag across it fires at most five times.
+qualitySlider.addEventListener('input', () => {
+  const i = parseInt(qualitySlider.value, 10) || 0;
+  showQuality(i);
+  setQuality(i);
 });
 $('btnJoin').addEventListener('click',   () => {
   const code = ($('codeInput').value || '').toUpperCase().trim();
@@ -334,6 +443,11 @@ socket.on('errorMsg', ({ message }) => {
 });
 
 socket.on('roomJoined', ({ code, playerIndex, host, token, bot }) => {
+  // We have a seat now, so the demo table behind the menu is done. This is the
+  // ONE place that has to clear it: a watcher is never sent roomJoined, and every
+  // way into a real room (create / join / quick / bot / resume) sends it before
+  // any startGame — so the handler below can trust net.watching.
+  stopWatching();
   net.myIndex = playerIndex; net.code = code;
   // The server is the authority on whether this room has a computer opponent —
   // a resumed client never went through the "Play Computer" button, so without
@@ -355,6 +469,7 @@ socket.on('lobby', ({ state, players }) => {
 
 socket.on('startGame', ({ game, layout }) => {
   buildScene();
+  setClothBlue(game === GAME_9BALL);   // 9-ball plays on blue cloth
   resetTopPan();             // recenter overhead for the new game
   // Pocketed-column length. Taken from the ruleset, NOT from the layout's
   // highest number: a resume rebuilds the rack from the balls still on the
@@ -367,6 +482,14 @@ socket.on('startGame', ({ game, layout }) => {
   // PH_PLACING until the new game's first gameState lands, so leaving this on
   // would ease the freshly racked cue ball toward the old game's spot.
   placeActive = false;
+  const cue = layout.find(b => b.id === 0);
+  if (cue) { localPlace.x = cue.x; localPlace.z = cue.z; }
+  // Spectating the demo table: there is a rack to render and nothing else to do.
+  // No seat, so no session to stamp; no screen change, because the menu is the
+  // point; no difficulty slider, because it is not our game. The class is added
+  // HERE rather than when we asked to watch, so the chrome only comes off once
+  // there is actually a table behind it.
+  if (net.watching) { document.body.classList.add('menuBg'); return; }
   if (net.resuming) {
     // Resuming into the SAME rack: keep the watched-shot counter. Zeroing it
     // here would make the next drop re-request shots we already sat through.
@@ -377,8 +500,6 @@ socket.on('startGame', ({ game, layout }) => {
   } else if (session) {
     saveSession({ ...session, shotIndex: 0 });   // new rack → new shot numbering
   }
-  const cue = layout.find(b => b.id === 0);
-  if (cue) { localPlace.x = cue.x; localPlace.z = cue.z; }
   showGame();
   placeBotSlider();          // show/hide the difficulty slider now, not only on the first gameState
   if (net.bot) socket.emit('botSkill', { value: botSkillVal() });  // sync slider → server
@@ -579,11 +700,18 @@ socket.on('connect', () => {
   if (session && session.token) {
     net.resuming = true;
     socket.emit('resume', { token: session.token, lastShot: session.shotIndex | 0 });
+  } else if (!net.inGame) {
+    startWatching();   // back on the menu, with a working socket: re-attach the demo table
   }
 });
 
 socket.on('disconnect', () => {
   net.connected = false;
+  // The demo table lives on the server; a dropped socket is no longer watching
+  // it, whatever the last frame on screen still shows. Cleared (rather than
+  // left set) so the reconnect above re-attaches instead of assuming it is still
+  // subscribed.
+  net.watching = false;
   if (reconnecting) return;               // already retrying
   reconnecting = true;
   reconnectDelay = 500;
@@ -687,6 +815,7 @@ function pocketedNow(baseline) {
 // only in where the playhead is, so the loop asks that and nothing else.
 function loop(now) {
   requestAnimationFrame(loop);
+  tickFps(now);            // before every early return, so the rate is the real one
   if (!sceneReady) return;
   if (input) input.tick();
   easePlacement();       // glide the cue ball toward the streamed ball-in-hand spot
@@ -694,7 +823,8 @@ function loop(now) {
 
   timeline.tick(now);    // advance the playhead if a shot is on screen
 
-  if (!net.inGame) { clearHud(); hideInGameControls(); render(); return; }
+  // Nothing to show: no game of ours and no demo table behind the menu.
+  if (!net.inGame && !net.watching) { clearHud(); hideInGameControls(); render(); return; }
 
   const past = timeline.current();        // the shot on screen, or null if live
   const cuePos = getCueMeshPosition();
@@ -730,7 +860,11 @@ function loop(now) {
   // Camera. Your choice, always — nothing overrides it and nothing changes it
   // behind your back. Overhead used to be forced while placing, spectating and
   // at game-over, which meant the view moved on you every time the turn did.
-  const view = camPref;
+  // The menu background is the exception, and not really one: it is scenery, not
+  // a game, so it is pinned to the overhead view (the whole table reads as a
+  // backdrop; sighting down someone else's stick does not) and leaves camPref
+  // alone for when there IS a game.
+  const view = net.watching ? 'top' : camPref;
   setViewMode(view);
   setCueVisible(interact === PH_AIMING || drawingBack());
 
@@ -751,18 +885,26 @@ function loop(now) {
 
   // HUD. The pocketed column counts from whatever was already down when the
   // shot on screen began, so balls appear in it as they drop — live or replayed.
-  const s = getStrikeOffset();
-  drawHud({
-    strikeX: s.x, strikeY: s.y,
-    power: getPullback() / getMaxPullback(),
-    view,
-    pocketed: pocketedNow(timeline.pocketedBaseline()),
-    ballCount,
-    bottomInset: reviewChromeHeight(),   // keep clear of the transport bar
-  });
-  updateViewUi(view);
-  // Don't let the win banner cover a replay.
-  $('banner').classList.toggle('show', !past && gs.winner >= 0);
+  // The menu background skips all of it: the brief there is the 3D scene and
+  // nothing else. (The DOM chrome is hidden by body.menuBg; these two are drawn,
+  // so they have to be told not to be.)
+  if (net.watching) {
+    clearHud();
+    hideInGameControls();
+  } else {
+    const s = getStrikeOffset();
+    drawHud({
+      strikeX: s.x, strikeY: s.y,
+      power: getPullback() / getMaxPullback(),
+      view,
+      pocketed: pocketedNow(timeline.pocketedBaseline()),
+      ballCount,
+      bottomInset: reviewChromeHeight(),   // keep clear of the transport bar
+    });
+    updateViewUi(view);
+    // Don't let the win banner cover a replay.
+    $('banner').classList.toggle('show', !past && gs.winner >= 0);
+  }
 
   render();
 }
@@ -786,6 +928,8 @@ window.__replay = () => {
   return { playing: !st.live, pending: st.unwatched, live: st.live, following: st.following, slot: st.slot };
 };
 window.__timeline = () => timeline.state();
+window.__gfx = graphicsDebug;   // debug: what the graphics preset did to the renderer
+window.__gfxSet = setQualityOverride;   // bench: force one preset field at a time
 
 const params = new URLSearchParams(location.search);
 if (params.get('name')) $('nameInput').value = params.get('name');
@@ -814,6 +958,8 @@ socket.on('connect', () => {
   else if (params.has('create')) socket.emit('createRoom', { name: nameVal(), game: gameVal() });
   else if (params.has('quick')) socket.emit('quickPlay', { name: nameVal(), game: gameVal() });
   else if (params.has('bot')) { net.bot = true; socket.emit('playBot', { name: nameVal(), game: gameVal(), skill: botSkillVal() }); }
+  // Nothing to auto-join: we are staying on the menu, so put a game behind it.
+  else startWatching();
 });
 
 // Suppress mobile browser gestures that fight the game: iOS pinch-zoom and

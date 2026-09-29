@@ -7,9 +7,15 @@ import { scene } from './scene.js';
 import { TEX_V_STRETCH, R, RACK_QUAT } from '../shared/constants.js';
 import { BALL_COLORS, ballStyle } from '../shared/balldefs.js';
 import { isInsideAnyPocket } from '../shared/pockets.js';
+import { qualityLevel, onQualityChange } from './settings.js';
 
 function makeBallTexture({ style, color = "#ffffff", number = null }) {
-  const size = 256;
+  const q = qualityLevel();
+  // Drawn, not loaded, so the graphics preset picks the size straight up front:
+  // there are ~16 of these live and they are the only textures on the balls, so
+  // 1024 -> 256 is 16x off the whole rack's texture memory. Every coordinate
+  // below is a fraction of `size`, so the artwork just scales.
+  const size = q.ballTex;
   const sY = TEX_V_STRETCH;
   const c0 = document.createElement('canvas'); c0.width = c0.height = size;
   const ctx0 = c0.getContext('2d');
@@ -55,19 +61,42 @@ function makeBallTexture({ style, color = "#ffffff", number = null }) {
   ctx.drawImage(c0, 0, 0, size, size, 0, -pad, size, size * sY);
 
   const tex = new THREE.CanvasTexture(c);
-  tex.anisotropy = 8; tex.minFilter = THREE.LinearMipmapLinearFilter; tex.magFilter = THREE.LinearFilter;
+  tex.anisotropy = 16; tex.minFilter = THREE.LinearMipmapLinearFilter; tex.magFilter = THREE.LinearFilter;
   tex.generateMipmaps = true;
   return tex;
 }
 
+// Geometry and textures are shared across every ball and live for the whole
+// session: syncRack rebuilds meshes after most shots, and at this tessellation
+// /texture size re-allocating per mesh would churn megabytes each time. Only the
+// per-mesh material is disposed per ball (see removeBallView); the shared
+// geometry is replaced wholesale when the preset changes its tessellation.
+//
+// The ball sphere is the single biggest source of geometry in the scene — 16 of
+// them at `ballSegs` x 3/4 that, and every one is a shadow caster, so each is
+// re-submitted once per shadow map on top of the main pass. That multiplier is
+// why it is worth a dial at all.
+let BALL_GEO = makeBallGeo();
+function makeBallGeo() {
+  const n = qualityLevel().ballSegs;
+  return new THREE.SphereGeometry(R, n, Math.round(n * 0.75));
+}
+const MARK_GEO = new THREE.SphereGeometry(R * 0.18, 24, 16);
+const texCache = new Map();
+function ballTexture({ style, color, number }) {
+  const key = `${style}|${color}|${number}`;
+  let tex = texCache.get(key);
+  if (!tex) { tex = makeBallTexture({ style, color, number }); texCache.set(key, tex); }
+  return tex;
+}
+
 function makeBallMesh({ style, color, number = null }) {
-  const geo = new THREE.SphereGeometry(R, 16, 10);
-  const map = makeBallTexture({ style, color, number });
+  const map = ballTexture({ style, color, number });
   const mat = new THREE.MeshStandardMaterial({ map, roughness: 0.05, metalness: 0.0 });
-  const mesh = new THREE.Mesh(geo, mat);
+  const mesh = new THREE.Mesh(BALL_GEO, mat);
   mesh.castShadow = true; mesh.receiveShadow = false;
 
-  const mark = new THREE.Mesh(new THREE.SphereGeometry(R * 0.18, 12, 10),
+  const mark = new THREE.Mesh(MARK_GEO,
     new THREE.MeshBasicMaterial({ color: 0xff2b2b }));
   mark.position.set(R * 0.7, R * 0.2, R * 0.1);
   mesh.add(mark);
@@ -77,7 +106,32 @@ function makeBallMesh({ style, color, number = null }) {
 }
 
 // --- id-keyed registry ------------------------------------------------------
-const views = new Map();   // id -> { mesh, number, style }
+const views = new Map();   // id -> { mesh, number, style, color }
+
+// Quality changed: the cached textures and the shared sphere are both the wrong
+// size now. Redraw/rebuild them and re-point every live ball at the replacements.
+//
+// Safe to do mid-shot, which matters because the slider is reachable while a
+// replay is playing: position and quaternion live on the MESH, and only its
+// `geometry` and `material` fields are reassigned here, so a ball keeps the exact
+// pose the playhead put it in. Nothing is re-racked and no frame is re-applied.
+//
+// `color` is carried in the view record purely so a ball can be re-textured here
+// without going back to BALL_COLORS for it.
+onQualityChange(() => {
+  for (const tex of texCache.values()) tex.dispose();
+  texCache.clear();
+  const oldGeo = BALL_GEO;
+  BALL_GEO = makeBallGeo();
+  for (const v of views.values()) {
+    v.mesh.material.map = ballTexture(v);
+    v.mesh.material.needsUpdate = true;
+    v.mesh.geometry = BALL_GEO;
+  }
+  // Only safe AFTER every mesh has been re-pointed — disposing a geometry still
+  // referenced by a drawn mesh drops its GPU buffers out from under the draw.
+  oldGeo.dispose();
+});
 
 export function buildRack(layout) {
   clearRack();
@@ -91,7 +145,7 @@ export function buildRack(layout) {
     // no frames stream while the table is at rest, so a mismatch here would
     // snap-rotate every ball on the break's first replay frame.
     mesh.quaternion.set(RACK_QUAT.x, RACK_QUAT.y, RACK_QUAT.z, RACK_QUAT.w);
-    views.set(spec.id, { mesh, number, style });
+    views.set(spec.id, { mesh, number, style, color });
   }
 }
 
@@ -107,13 +161,16 @@ export function snapshotRack() {
   return out;
 }
 
+// Drop a ball mesh. Geometry and texture are shared/cached, so only the
+// per-mesh materials (ball + its spin marker) are ours to release.
+function disposeBallMesh(mesh) {
+  scene.remove(mesh);
+  mesh.material.dispose();
+  for (const child of mesh.children) child.material?.dispose();
+}
+
 export function clearRack() {
-  for (const { mesh } of views.values()) {
-    scene.remove(mesh);
-    mesh.geometry.dispose();
-    if (mesh.material.map) mesh.material.map.dispose();
-    mesh.material.dispose();
-  }
+  for (const { mesh } of views.values()) disposeBallMesh(mesh);
   views.clear();
 }
 
@@ -135,7 +192,7 @@ export function syncRack(items) {
       if (v) removeBallView(it.id);
       const style = ballStyle(number);
       const color = number != null ? BALL_COLORS[number] : "#ffffff";
-      v = { mesh: makeBallMesh({ style, color, number }), number, style };
+      v = { mesh: makeBallMesh({ style, color, number }), number, style, color };
       views.set(it.id, v);
     }
     v.mesh.position.set(it.x, it.y, it.z);
@@ -178,10 +235,7 @@ export function applyBallsFrameLerp(itemsA, itemsB, alpha) {
 export function removeBallView(id) {
   const v = views.get(id);
   if (!v) return;
-  scene.remove(v.mesh);
-  v.mesh.geometry.dispose();
-  if (v.mesh.material.map) v.mesh.material.map.dispose();
-  v.mesh.material.dispose();
+  disposeBallMesh(v.mesh);
   views.delete(id);
 }
 

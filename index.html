@@ -102,6 +102,35 @@
             </div>
           </div>
 
+          <!-- Collapsible options: aim direction + graphics quality. Both are
+               stored per-device in localStorage and applied live (settings.js);
+               nothing here needs a reload or a new game. -->
+          <div id="optionsPanel" class="optionsPanel collapsed">
+            <button id="optionsToggle" class="optionsToggle">Options ▸</button>
+            <div class="optionsBody">
+              <label class="optCheck" title="Drag the cue instead of the table: the aim follows your finger rather than opposing it.">
+                <input id="reverseAim" type="checkbox" />
+                <span>Reverse aim</span>
+              </label>
+              <label class="optCheck" title="Frame rate in the top-right corner. Green is smooth, amber is dropping frames, red is struggling — turn the graphics slider down.">
+                <input id="showFps" type="checkbox" />
+                <span>Show FPS</span>
+              </label>
+              <div class="optField">
+                <div class="optLabel">Graphics <b id="qualityName">High</b></div>
+                <!-- Quantized: 5 presets, step 1, notched by the datalist. -->
+                <input id="qualitySlider" class="qualitySlider" type="range"
+                       min="0" max="4" step="1" value="3" list="qualityTicks" />
+                <datalist id="qualityTicks">
+                  <option value="0"></option><option value="1"></option>
+                  <option value="2"></option><option value="3"></option>
+                  <option value="4"></option>
+                </datalist>
+                <div id="qualityBlurb" class="optHint"></div>
+              </div>
+            </div>
+          </div>
+
           <!-- Collapsible instructions -->
           <div id="helpPanel" class="helpPanel collapsed">
             <button id="helpToggle" class="helpToggle">操作说明 ▸</button>
@@ -124,6 +153,11 @@
           </div>
         </div>
       </div>
+
+      <!-- Frame-rate readout (Options > Show FPS). Top-right is the only corner
+           with nothing in it: the menu is top-left, the names top-middle, and
+           both bottom corners carry the view/zoom clusters. -->
+      <div id="fpsMeter" class="fpsMeter hidden"></div>
 
       <!-- Top-middle: player names (current turn is bold + underlined) + status -->
       <div id="players" class="players"></div>

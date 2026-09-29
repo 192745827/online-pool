@@ -13,9 +13,10 @@ import {
   tableW, tableH, FIXED_DT, R, g, RACK_QUAT,
 } from '../shared/constants.js';
 import {
-  setBodyFilter, stepAndDamp, tmpVec3, AmmoLib,
+  setBodyFilter, stepAndApplyFriction, tmpVec3, AmmoLib,
+  destroyRigidBody, destroyWorld,
   CG_BALL, CG_SUNK,
-  MASK_BALL_NORMAL, MASK_BALL_NEAR_POCKET, MASK_SUNK,
+  MASK_BALL_NORMAL, MASK_BALL_OFF_FELT, MASK_SUNK,
 } from './physics.js';
 import { buildTableWorld, railPoints } from './table.world.js';
 import { computeBounds, resolvePlacement, HEAD_STRING_X } from './placement.js';
@@ -26,7 +27,7 @@ import { resetRack, setBallPosition, spotBall } from './balls.logic.js';
 import { createGame } from '../shared/game.js';
 import { densify } from '../shared/clearance.js';
 import {
-  POCKET_Y_THRESHOLD, isInsideAnyPocket, isNearPocket,
+  POCKET_Y_THRESHOLD, isInsideAnyPocket, isOffFelt,
 } from '../shared/pockets.js';
 import { PH_AIMING, PH_SHOOTING, PH_PLACING, PH_OVER } from '../shared/net/packets.js';
 
@@ -62,9 +63,9 @@ const railClearPts = densify(railPoints);   // sampled rail for cue-clearance
 
 export class RoomSim {
   constructor(rulesetId) {
-    const { world, railPtr } = buildTableWorld();
+    const { world, railPtrs } = buildTableWorld();
     this.world = world;
-    this.railPtr = railPtr;     // scanContacts identifies rail hits by this ptr
+    this.railPtrs = railPtrs;   // scanContacts identifies rail hits by these ptrs
     this.balls = [];
     this.game = createGame(rulesetId, this.balls);
 
@@ -81,6 +82,20 @@ export class RoomSim {
   }
 
   // --- Public API used by the server -----------------------------------------
+  // Give the room's world back to the Ammo heap. A RoomSim that is merely
+  // dropped costs ~4 MB that never returns — the JS collector cannot see any of
+  // it (see the ownership note in physics.js) — so every path that ends a room
+  // has to come through here. Idempotent, and the sim is unusable afterwards.
+  dispose() {
+    if (!this.world) return;
+    destroyWorld(this.world);
+    this.world = null;
+    this.balls = [];
+    this.sunk = [];
+    this.ballByPtr.clear();
+    this.railPtrs = new Set();
+  }
+
   setPlayerNames(a, b) {
     this.game.getState().players[0].name = a;
     this.game.getState().players[1].name = b;
@@ -90,7 +105,7 @@ export class RoomSim {
     if (changeGame) this.game.setRuleset(changeGame);
     else this.game.reset();
     const layout = this.game.rackLayout({ tableW, tableH });
-    for (const b of this.sunk) this.world.removeRigidBody(b.body);   // clear last game's pocketed balls
+    for (const b of this.sunk) destroyRigidBody(this.world, b.body);   // clear last game's pocketed balls
     this.sunk = [];
     resetRack(this.world, this.balls, layout);
     this.balls.forEach((b, i) => { b.id = i; b.scratched = false; b.pendingSpot = false; });
@@ -114,7 +129,7 @@ export class RoomSim {
   settleRack() {
     const SETTLE_MIN = 0.1, SETTLE_MAX = 2.0;
     for (let t = 0; t < SETTLE_MAX; t += FIXED_DT) {
-      stepAndDamp(this.world, this.balls, FIXED_DT);
+      stepAndApplyFriction(this.world, this.balls, FIXED_DT);
       if (t >= SETTLE_MIN && this.ballsAtRest()) break;
     }
     const q = new AmmoLib.btQuaternion(RACK_QUAT.x, RACK_QUAT.y, RACK_QUAT.z, RACK_QUAT.w);
@@ -216,7 +231,9 @@ export class RoomSim {
     const removals = [];
     let simT = 0, frameAcc = 0, settled = false;
     while (simT < MAX_SHOT_SECONDS) {
-      stepAndDamp(this.world, this.balls, FIXED_DT);
+      // Pass `sunk` too so balls resting in a cup get its (grippier) friction and
+      // settle; they collide only with the cup and each other, never in play.
+      stepAndApplyFriction(this.world, this.balls, FIXED_DT, this.sunk);
       this.scanContacts();
       // Pocket handling runs EVERY substep, not once per keyframe. Both are
       // physics questions and neither has anything to do with how often the
@@ -225,15 +242,22 @@ export class RoomSim {
       // to REPLAY_FRAME_DT, so halving the keyframe rate to save bandwidth
       // would also have halved pocketing accuracy.
       //
-      // updatePocketMasks is the one that actually mattered: it swaps a ball
-      // near a hole onto the triangulated felt so it CAN tip in, and running it
-      // late leaves a fast ball rolling across the pocket mouth on the flat
-      // plane, as if the hole were not there. At 8 m/s a keyframe is 128 mm of
-      // travel against a 200 mm mouth. checkPocketed only observes a ball that
-      // is already below the lip and falling, which spans many substeps — its
-      // cadence measurably changed nothing, but it belongs here for the same
-      // reason.
-      this.updatePocketMasks();
+      // updateFeltMasks is the one that actually mattered: it swaps a ball that
+      // has left the felt outline onto the triangulated felt so it CAN tip in,
+      // and running it late leaves a fast ball rolling across the pocket mouth
+      // on the flat plane, as if the hole were not there. At 8 m/s a keyframe is
+      // 128 mm of travel against a 117 mm corner mouth — it can miss the opening
+      // outright. checkPocketed only observes a
+      // ball that is already below the lip and falling, which spans many
+      // substeps — its cadence measurably changed nothing, but it belongs here
+      // for the same reason.
+      //
+      // The threshold now sits exactly ON the outline rather than a radius
+      // outside it, so this sampling rate is the entire margin: a ball is held
+      // up by the plane for at most the one substep in which it crosses out
+      // (32 mm at 8 m/s). That is affordable only at substep cadence. Do not
+      // move this call.
+      this.updateFeltMasks();
       this.checkPocketed();                       // sinks pocketed balls (not removed yet)
       simT += FIXED_DT; frameAcc += FIXED_DT;
       if (frameAcc >= REPLAY_FRAME_DT - 1e-9) {
@@ -312,7 +336,9 @@ export class RoomSim {
 
   scanContacts() {
     const disp = this.world.getDispatcher();
-    const railPtr = this.railPtr;
+    // Cushions and pocket wire are separate bodies (they are separate
+    // materials), but both are "a rail" as far as the rules are concerned.
+    const railPtrs = this.railPtrs;
     const n = disp.getNumManifolds();
     for (let i = 0; i < n; i++) {
       const mani = disp.getManifoldByIndexInternal(i);
@@ -325,26 +351,28 @@ export class RoomSim {
           const obj = cue0 ? ball1 : ball0;
           if (obj.number != null) this.game.recordFirstHit(obj.number);
         }
-      } else if (ball0 && p1 === railPtr) {
+      } else if (ball0 && railPtrs.has(p1)) {
         this.game.recordRail(ball0.number);
-      } else if (ball1 && p0 === railPtr) {
+      } else if (ball1 && railPtrs.has(p0)) {
         this.game.recordRail(ball1.number);
       }
     }
   }
 
-  // Near a pocket, swap the ball onto the triangulated felt (real hole) so it can
-  // tip in; elsewhere keep it on the flat plane. Just a collision-filter switch —
-  // the two felt surfaces are coplanar, so nothing pops.
-  updatePocketMasks() {
+  // Once a ball's centre leaves the felt outline, swap it onto the triangulated
+  // felt (real hole) so it can tip in; inside the outline keep it on the flat
+  // plane. Just a collision-filter switch, and a free one: inside the outline
+  // the two surfaces give a sphere the same contact, so the swap happens at the
+  // one point where they start to differ and nothing pops. See isOffFelt.
+  updateFeltMasks() {
     for (const b of this.balls) {
       if (b.pendingSpot) continue;
       const o = b.body.getWorldTransform().getOrigin();
-      const near = isNearPocket(o.x(), o.z());
-      if (near === b.nearPocket) continue;
-      setBodyFilter(this.world, b.body, CG_BALL, near ? MASK_BALL_NEAR_POCKET : MASK_BALL_NORMAL);
-      b.nearPocket = near;
-      if (near) b.body.activate();
+      const off = isOffFelt(o.x(), o.z());
+      if (off === b.offFelt) continue;
+      setBodyFilter(this.world, b.body, CG_BALL, off ? MASK_BALL_OFF_FELT : MASK_BALL_NORMAL);
+      b.offFelt = off;
+      if (off) b.body.activate();
     }
   }
 
@@ -395,6 +423,10 @@ export class RoomSim {
     const i = this.balls.indexOf(b);
     if (i >= 0) this.balls.splice(i, 1);
     b.sunk = true;
+    // Frictionless in Bullet like every body, but the analytic pass now rubs it
+    // against the cup (SURF_CUP) — runShotAndRecord passes `sunk` to
+    // stepAndApplyFriction — so it settles instead of sliding forever. It now
+    // collides only with the cup and other sunk balls (MASK_SUNK).
     setBodyFilter(this.world, b.body, CG_SUNK, MASK_SUNK);
     this.sunk.push(b);
     this.rebuildBallPtrMap();   // its ptr must no longer count as a live ball
@@ -405,7 +437,9 @@ export class RoomSim {
   // clears their meshes as the replay ends. Returns the removals to append.
   clearSunk(frame) {
     const out = this.sunk.map(b => ({ id: b.id, frame }));
-    for (const b of this.sunk) this.world.removeRigidBody(b.body);
+    // Destroyed, not just unlinked: the ball is out of the game for good, and a
+    // body that is only removed from the world stays in the Ammo heap forever.
+    for (const b of this.sunk) destroyRigidBody(this.world, b.body);
     this.sunk = [];
     return out;
   }

@@ -2,21 +2,52 @@
 export const tableW = 2.24, tableH = 1.12;
 export const R = 0.028575, m = 0.170097, g = 9.81;
 
-export const e_ball  = Math.sqrt(0.95);
-export const e_rail  = 0.8 / e_ball;
+export const e_ball  = Math.sqrt(0.95);   // ball·ball combine = 0.95
+export const e_rail  = 0.98 / e_ball;      // ball·rail combine = 0.98
 export const e_table = 0.6 / e_ball;
-export const e_pocket = 0/e_ball;
+export const e_pocket = 0.2/e_ball;
 
-export const mu_ball   = Math.sqrt(0.06);
-export const mu_wall   = 0.1 / mu_ball;
-export const mu_ground = 0.2 / mu_ball;
-export const mu_pocket = 0.3/mu_ball;
+// Coefficients the analytic friction pass actually uses (see applyFriction).
+// The cloth/rail kinetic values are exactly the old combined products, so
+// sliding behaviour matches what Bullet used to apply.
+export const mu_felt_kinetic = 0.20;   // cloth slide→roll friction (was mu_ball·mu_ground)
+export const mu_rail_kinetic = 0.14;   // rail tangential friction
+export const mu_cup_kinetic  = 0.10;   // pocket-cup slide friction (plastic/rubber, grippier
+                                       // than cloth) — bleeds off a ball rattling in the cup
+
+// Ball–ball dynamic friction FALLS with the relative tangential surface speed s
+// (m/s) at contact, which is what makes object-ball throw depend on shot speed
+// (soft shots throw more, firm shots less). Empirical fit for clean pool balls
+// (Marlow's data, per ther):
+//   mu(s) = mu_ball_asym + mu_ball_amp · exp(−mu_ball_decay · s)
+export const mu_ball_asym  = 0.009951;  // high-speed asymptote
+export const mu_ball_amp   = 0.108;     // extra friction as s → 0 (μ(0) = asym + amp ≈ 0.118)
+export const mu_ball_decay = 1.088;     // per (m/s), how fast the coefficient falls with speed
 
 export const rollingFric = 0.000;
 export const spinningFric = 0.000;
 
-export const mu_felt_linear = 0.01;
-export const spin_decel_rad_s2 = 10;
+// The two TUNING KNOBS for cloth friction, both expressed as the deceleration a
+// ball actually experiences rolling/spinning on the flat felt. They are stated
+// this way rather than as raw coefficients because that is the quantity you can
+// observe on the table — and because ai.js aims with A_FELT = mu_felt_linear*g,
+// so the number the AI models and the number the physics applies are the same.
+export const mu_felt_linear = 0.01;      // linear decel = mu_felt_linear * g  (m/s^2)
+export const spin_decel_rad_s2 = 10;     // spin decel about the surface normal (rad/s^2)
+
+// Contact friction coefficients, consumed by applyContactFriction in
+// src/server/physics.js. The friction pass works in FORCES — a rolling
+// resistance F = -C_rr*N*v̂ and a spin torque tau = -C_spin*N*R*sign(w·n)*n —
+// so the knobs above have to be converted into coefficients. On the flat felt a
+// resting ball has N = m*g exactly, which is what makes the conversion exact:
+//
+//   linear:  a     = C_rr*N/m       = C_rr*g            =>  C_rr   = mu_felt_linear
+//   spin:    dw/dt = C_spin*N*R/I   = 5*C_spin*g/(2*R)  =>  C_spin = 2*R*spin_decel/(5*g)
+//
+// using I = (2/5)*m*R^2 for a solid sphere. Derived rather than written out as
+// decimals so that retuning a knob above cannot silently desync the two.
+export const C_rr   = mu_felt_linear;
+export const C_spin = 2 * R * spin_decel_rad_s2 / (5 * g);
 
 export const wireY = 0.034925;
 export const rodR  = 0.005;
@@ -62,21 +93,28 @@ export const rail_cap = inset / 2;
 // the radius that lands the sides exactly tangent to those cups instead, so the
 // bottom section hugs all six cups at once.
 export const cabinetRBottom = 0.110;
-export const cabinetRTop    = cabinetRBottom + 0.055;
+export const cabinetRTop    = cabinetRBottom + 0.035;
 
-// The deck is the flat ring of wood that closes the cabinet off at the top. Its
-// face sits at pocketWireY, which is the rail top and the wire's axis at once —
-// the two are the same height — so it is flush with the rails and cut through
-// the middle of the rod. One rod RADIUS thick, which lands its underside on the
-// bottom of the rod: the wire ends up half-sunk, lower half buried and upper
-// half standing proud. That underside is also where a pocket's raised back wall
-// stops, so the cabinet builder and the cup read these rather than keep a copy.
-export const cabinetDeckThickness = rodR;
-export const cabinetYTop          = pocketWireY;                         // rail top = wire axis
-export const cabinetDeckUnderY    = cabinetYTop - cabinetDeckThickness;  // = rod bottom
+// The bullnose along the cabinet's top outer edge: a quarter-round rolling from
+// the deck's flat down onto the skirt, all the way around the loop. Because a
+// section is fixed by its radius alone, the roll is just a run of sections whose
+// radius sweeps a quarter circle inward — the widest one still lands at
+// cabinetRTop, so the table's footprint is unchanged and only the DECK loses
+// this much width. That flat is 0.13 m wide (inset out to cabinetRTop + 0.015),
+// so this has room to grow, but past ~0.03 it starts crowding the rail line.
+export const cabinetEdgeR = 0.018;
+
+// The deck is the flat ring of wood that closes the cabinet off at the top — a
+// single face with no thickness, so it has no underside to see. It sits at
+// pocketWireY, which is the rail top and the wire's axis at once — the two are
+// the same height — so it is flush with the rails and passes through the middle
+// of the rod, leaving the wire half-sunk.
+export const cabinetYTop = pocketWireY;   // rail top = wire axis = deck face
 // The underside of the cup's base disc, not the cup floor: stopping at the floor
 // leaves the lower half of that disc showing beneath the wood at the middle
-// pockets, where the section is tangent to the cups and hides nothing.
+// pockets, where the section is tangent to the cups and hides nothing. It is
+// also where the cabinet's bottom face lies, and that face wants to land flush
+// with the cups rather than slice through them.
 export const cabinetYBottom = cupY - cupDepth * 0.5 - cupBase * 0.5;
 
 export const mid_mouth = 0.132;

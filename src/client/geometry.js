@@ -4,7 +4,8 @@
 // moved to geometry.physics.js.
 import * as THREE from "/lib/three.module.js";
 import { table_parts, rail_solid, RAIL_FACES, cabinet_section, table_top_outline, pocket_positions } from '../shared/table.js';
-import { pocketWireY, cabinetDeckThickness, inset, cabinetRTop } from '../shared/constants.js';
+import { pocketWireY, inset, cabinetRTop, cabinetEdgeR } from '../shared/constants.js';
+import { qualityLevel, onQualityChange } from './settings.js';
 export { rail_pts, felt_pts, pocket_positions, table_parts } from '../shared/table.js';
 
 export function makePolylineMesh(pointsXZ, wireR, wireY, opts = {}) {
@@ -168,39 +169,6 @@ const FELT_MAPS = {
       normalMap:    '/assets/felt/normal.png',
       roughnessMap: '/assets/felt/roughness.jpg',
 };
-// Memoised: the bed and the rails are the same cloth, so they share one set of
-// GPU textures. Loading a second copy would both waste memory and risk the two
-// drifting to different repeats — and the whole point is that the weave runs
-// across the bed and up onto the rails at one continuous scale.
-let feltTextures = null;
-function makeFeltTextures() {
-      if (feltTextures) return { ...feltTextures };
-      const loader = new THREE.TextureLoader();
-      const out = {};
-      for (const [slot, url] of Object.entries(FELT_MAPS)) {
-        const tex = loader.load(url);
-        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-        tex.repeat.set(FELT_REPEAT, FELT_REPEAT);
-        tex.anisotropy = 8;
-        // Only the colour map is authored in sRGB; normal/roughness are data.
-        if (slot === 'map') tex.colorSpace = THREE.SRGBColorSpace;
-        out[slot] = tex;
-      }
-      feltTextures = out;
-      return { ...out };
-}
-
-// Felt on a mesh whose UVs are already in metres (see makeTableRails). Kept
-// beside the bed's felt setup so the two can't drift apart.
-function feltMaterial() {
-      const mat = new THREE.MeshStandardMaterial({ side: THREE.FrontSide, flatShading: true });
-      Object.assign(mat, makeFeltTextures());
-      mat.color.set(0xffffff);          // the baize photo IS the colour
-      mat.roughness = 1.0;              // roughnessMap multiplies this
-      mat.metalness = 0.0;
-      mat.normalScale = new THREE.Vector2(0.6, 0.6);
-      return mat;
-}
 
 // Scanned oak table wood (assets/wood/) for the cabinet, replacing the old flat
 // brown. Same idea as the felt: the colour lives IN the photo, so the material
@@ -220,23 +188,167 @@ const WOOD_MAPS = {
       map:          '/assets/wood/color.jpg',
       roughnessMap: '/assets/wood/roughness.jpg',
 };
-let woodTextures = null;
-function makeWoodTextures() {
-      if (woodTextures) return { ...woodTextures };
+
+// ---- Texture sets, sized by the graphics preset -------------------------------
+//
+// Both surfaces are the same story: a memoised set of GPU textures shared by
+// every mesh that wears them (the bed and the rails are the same cloth, the
+// skirt and the deck the same oak), built at whatever resolution and map count
+// the current preset asks for.
+//
+// NEITHER dial here is about frame time — both measured at or under the 0.5 ms
+// noise floor. They save different resources, and mixing them up is how you end
+// up degrading an image for nothing:
+//   texMax     VRAM. Caps each map's edge by redrawing the decoded image into a
+//              smaller canvas. It does NOT save download — the file is fetched at
+//              full size and shrunk after decode, because there is one file per
+//              map on disk. What it saves is enormous though: the five scanned
+//              maps at 4K are ~380 MB of decoded texture once mipmapped, against
+//              ~28 MB at 1K. That is the difference between running and dying on
+//              a phone.
+//   normalMap  DOWNLOAD. Dropping the slot means it is never fetched, and
+//              felt/normal.png is 11 MB on its own — the only lever here that
+//              avoids a transfer at all.
+//
+// The roughness map is NOT a dial: it measured +0.2 ms in both contexts, it is a
+// fraction of the normal map's size, and it carries the whole sheen of the grain.
+// Anisotropy is pinned at 16 for the same reason — 1 -> 16 measured 0.0 / +0.2 ms
+// even on the 4K bed at a grazing angle, which is the worst case for it.
+//
+// Every slot a preset omits must be actively nulled on the material rather than
+// just left out of the assign — a material built at Ultra and then dropped to
+// Low would otherwise keep the very maps the preset is trying to shed. That is
+// what TEX_SLOTS is for.
+const TEX_SLOTS = ['map', 'normalMap', 'roughnessMap'];
+const ANISOTROPY = 16;
+
+function buildTextureSet(maps, repeat) {
+      const q = qualityLevel();
       const loader = new THREE.TextureLoader();
       const out = {};
-      for (const [slot, url] of Object.entries(WOOD_MAPS)) {
-        const tex = loader.load(url);
+      for (const [slot, url] of Object.entries(maps)) {
+        if (slot === 'normalMap' && !q.normalMap) continue;
+        // The image is decoded at full size and then shrunk in place: three has
+        // already stamped it onto the texture by the time onLoad runs, so
+        // swapping .image and re-flagging it is what makes the upload use the
+        // small one. Textures below the cap are left exactly as they are.
+        const tex = loader.load(url, (t) => {
+          const small = downscaleImage(t.image, q.texMax);
+          if (small !== t.image) { t.image = small; t.needsUpdate = true; }
+        });
         tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-        tex.repeat.set(WOOD_REPEAT, WOOD_REPEAT);
-        tex.anisotropy = 8;
+        tex.repeat.set(repeat, repeat);
+        tex.anisotropy = ANISOTROPY;
+        // Only the colour map is authored in sRGB; normal/roughness are data.
         if (slot === 'map') tex.colorSpace = THREE.SRGBColorSpace;
         out[slot] = tex;
       }
-      woodTextures = out;
-      return { ...out };
+      return out;
 }
 
+// Redraw an image into a canvas whose long edge is at most maxPx. Both source
+// tiles are square powers of two, so every step down stays a power of two and
+// keeps repeat-wrapping + mipmapping happy.
+function downscaleImage(img, maxPx) {
+      const w = img?.naturalWidth || img?.width || 0;
+      const h = img?.naturalHeight || img?.height || 0;
+      const longest = Math.max(w, h);
+      if (!longest || longest <= maxPx) return img;
+      const s = maxPx / longest;
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(w * s));
+      c.height = Math.max(1, Math.round(h * s));
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      return c;
+}
+
+// The two live sets, plus the materials wearing them. Both are rebuilt in place
+// when the quality slider moves, which is why the materials have to be tracked:
+// they are handed out to meshes all over the scene and there is no other way
+// back to them.
+let feltTextures = null, woodTextures = null;
+const feltMaterials = new Set(), woodMaterials = new Set();
+
+// 9-ball is played on blue cloth. The scanned baize is green, so instead of
+// shipping a second texture set we recolour it in the shader (see applyFelt).
+let clothBlue = false;
+// Flip the cloth green<->blue and repaint every live felt material. Called per
+// game (the scene is built once and reused, so the material persists across a
+// switch between rulesets). No-op before any felt exists — newly built felt then
+// picks up the flag on its own.
+export function setClothBlue(on) {
+      const next = !!on;
+      if (next === clothBlue) return;
+      clothBlue = next;
+      for (const mat of feltMaterials) applyFelt(mat);
+}
+
+const feltSet = () => (feltTextures ||= buildTextureSet(FELT_MAPS, FELT_REPEAT));
+const woodSet = () => (woodTextures ||= buildTextureSet(WOOD_MAPS, WOOD_REPEAT));
+// 9-ball's blue baize: only the colour map differs (hue-rotated from the green
+// scan by scripts/make_blue_felt.py), so it is memoised on its own and reuses
+// the green set's normal/roughness — the weave and nap are identical cloth.
+const FELT_BLUE_MAPS = { map: '/assets/felt/color2.jpg' };
+let feltBlueTextures = null;
+const feltBlueMap = () => (feltBlueTextures ||= buildTextureSet(FELT_BLUE_MAPS, FELT_REPEAT)).map;
+
+// Dress a material as baize. The photo IS the colour, so the material tints
+// white — a green base here would multiply the green twice and turn the cloth
+// muddy.
+function applyFelt(mat) {
+      feltMaterials.add(mat);
+      const set = feltSet();
+      for (const slot of TEX_SLOTS) mat[slot] = set[slot] || null;
+      // 9-ball plays on blue cloth: swap in the hue-rotated colour map. Normal
+      // and roughness stay the green set's — same weave, only the colour changes.
+      if (clothBlue) mat.map = feltBlueMap();
+      mat.color.set(0xffffff);
+      mat.metalness = 0.0;
+      // roughnessMap MULTIPLIES this, so 1.0 is "let the map decide". With no
+      // map that same 1.0 is a real value — dead matte, which for worsted cloth
+      // is close enough to right that the low presets need no other fix-up.
+      mat.roughness = 1.0;
+      mat.normalScale = new THREE.Vector2(0.6, 0.6);
+      mat.needsUpdate = true;
+      return mat;
+}
+
+// Dress a material as the scanned oak. Same reasoning as applyFelt, except the
+// no-map roughness matters more here: the grain's sheen lives entirely in the
+// roughness map, so without it the wood needs the old hand-set 0.62 or the
+// cabinet reads as cardboard.
+function applyWood(mat) {
+      woodMaterials.add(mat);
+      const set = woodSet();
+      for (const slot of TEX_SLOTS) mat[slot] = set[slot] || null;
+      mat.color.set(0xffffff);
+      mat.roughness = 1.0;
+      mat.needsUpdate = true;
+      return mat;
+}
+
+// Quality changed: throw both sets away and re-dress every material that was
+// ever built from them. The old textures are disposed rather than dropped —
+// they are the megabytes the lower preset was asked to reclaim.
+onQualityChange(() => {
+      for (const set of [feltTextures, woodTextures, feltBlueTextures]) {
+        if (set) for (const tex of Object.values(set)) tex.dispose();
+      }
+      feltTextures = woodTextures = feltBlueTextures = null;
+      for (const mat of feltMaterials) applyFelt(mat);
+      for (const mat of woodMaterials) applyWood(mat);
+});
+
+// Felt on a mesh whose UVs are already in metres (see makeTableRails).
+function feltMaterial() {
+      return applyFelt(new THREE.MeshStandardMaterial({ side: THREE.FrontSide, flatShading: true }));
+}
+
+// A horizontal surface from a closed polyline, optionally with holes punched in
+// it. `thickness` 0 gives a single flat FACE lying at y — no sides, no underside,
+// just the one sheet of triangles; any positive thickness extrudes a slab whose
+// MIDPLANE is at y. Both are double-sided, so a bare face is still visible from
+// underneath.
 export function makePlanarMeshFromPolyline(points, thickness, y, options = {}) {
       if (!points || points.length < 3) throw new Error("Need ≥3 points");
       const {
@@ -268,9 +380,14 @@ export function makePlanarMeshFromPolyline(points, thickness, y, options = {}) {
         shape.holes.push(h);
       }
 
-      const extrudeSettings = { depth: thickness, bevelEnabled: false, curveSegments: 12 };
-      const geom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-      geom.translate(0, 0, y-thickness / 2);
+      // ShapeGeometry lays the face in the local XY plane at z = 0 and takes its
+      // UVs straight from the shape's own coordinates — metres, same as the
+      // extruded top face and the skirt, so the wood tiles across all of them at
+      // one scale.
+      const geom = thickness > 0
+        ? new THREE.ExtrudeGeometry(shape, { depth: thickness, bevelEnabled: false, curveSegments: 12 })
+        : new THREE.ShapeGeometry(shape, 12);
+      geom.translate(0, 0, y - thickness / 2);
       geom.computeVertexNormals();
       geom.computeBoundingBox();
       geom.computeBoundingSphere();
@@ -278,17 +395,8 @@ export function makePlanarMeshFromPolyline(points, thickness, y, options = {}) {
       const mat = new THREE.MeshStandardMaterial({
         color, metalness, roughness, side: THREE.DoubleSide,
       });
-      if (felt) {
-        Object.assign(mat, makeFeltTextures());
-        mat.color.set(0xffffff);          // the baize photo IS the colour
-        mat.roughness = 1.0;              // roughnessMap multiplies this
-        mat.normalScale = new THREE.Vector2(0.6, 0.6);
-      }
-      if (wood) {
-        Object.assign(mat, makeWoodTextures());
-        mat.color.set(0xffffff);          // the wood photo IS the colour
-        mat.roughness = 1.0;              // roughnessMap multiplies this
-      }
+      if (felt) applyFelt(mat);
+      if (wood) applyWood(mat);
 
       const mesh = new THREE.Mesh(geom, mat);
       mesh.receiveShadow = receiveShadow;
@@ -297,8 +405,8 @@ export function makePlanarMeshFromPolyline(points, thickness, y, options = {}) {
       return mesh;
     }
 
-// The wooden cabinet: a tapered skirt around the whole table, plus the flat
-// deck that closes it off at the top.
+// The wooden cabinet: a tapered skirt around the whole table, capped by a flat
+// deck at the top and a flat floor at the bottom.
 //
 // The skirt is one ruled surface. Both sections come from cabinet_section() with
 // the same segment count, so lofting them is an index-for-index quad strip — and
@@ -312,16 +420,23 @@ export function makePlanarMeshFromPolyline(points, thickness, y, options = {}) {
 // no holes cut for them — the wood does overhang the back of each cup, which is
 // how a real pocket liner sits.
 //
-// Vertically its face is flush with the rails, which is also the wire's axis, and
-// it is one rod radius thick (see cabinetYTop) — so it cuts the rod through the
-// middle, leaving the lower half buried and the upper half standing proud.
+// The floor closes the bottom off the same way, minus the cut-out: the skirt's
+// own bottom ring filled solid, so the underside reads as a closed box.
+//
+// Both caps are single FACES, not slabs. Nothing ever sees an edge of either —
+// the deck's outer edge is the skirt's top ring and the floor's is its bottom
+// ring, so a thickness would only ever be hidden behind the skirt. The deck's
+// plane is flush with the rails, which is also the wire's axis, so it cuts the
+// rod through the middle, leaving the lower half buried and the upper half
+// standing proud.
 export function makeTableCabinet(tableW, tableH, opts = {}) {
       const {
         rTop, rBottom, yTop, yBottom,
         color = 0x5c3a21,
         roughness = 0.62,
         segments = 24,
-        deckThickness = cabinetDeckThickness,
+        edgeR = cabinetEdgeR,
+        edgeSegments = 6,
       } = opts;
 
       const group = new THREE.Group();
@@ -329,37 +444,69 @@ export function makeTableCabinet(tableW, tableH, opts = {}) {
         color, roughness, metalness: 0.0, side: THREE.DoubleSide, flatShading: false,
       });
       // The wood photo IS the colour; the roughness map carries the grain's sheen.
-      Object.assign(mat, makeWoodTextures());
-      mat.color.set(0xffffff);
-      mat.roughness = 1.0;
+      applyWood(mat);
 
       // --- skirt ---------------------------------------------------------
-      const top = cabinet_section(tableW, tableH, rTop, segments);
-      const bot = cabinet_section(tableW, tableH, rBottom, segments);
-      const n = top.length;
+      // A stack of rings, lofted in order. Every ring is a cabinet_section, so
+      // they all carry the same point count and consecutive ones join as a plain
+      // index-for-index quad strip however many there are.
+      //
+      // The bullnose comes first: `edgeR` sweeps a quarter circle from the deck's
+      // flat (radius rTop - edgeR at yTop, tangent horizontal) out and down to the
+      // cabinet's widest section (rTop at yTop - edgeR, tangent vertical), from
+      // where the original taper carries on to the bottom. The roll is therefore
+      // paid for out of the DECK's width, not the footprint. The taper still needs
+      // only its two rings — radius is linear in height, so two describe it
+      // exactly.
+      const arc90 = [];
+      for (let i = 0; i <= edgeSegments; i++) {
+        const th = (i / edgeSegments) * (Math.PI / 2);
+        arc90.push({ r: rTop - edgeR + edgeR * Math.sin(th), y: yTop - edgeR + edgeR * Math.cos(th) });
+      }
+      const rings = [...arc90, { r: rBottom, y: yBottom }]
+        .map(({ r, y }) => ({ y, pts: cabinet_section(tableW, tableH, r, segments) }));
+      const n = rings[0].pts.length;
 
-      // UVs in METRES so the wood tiles at the same tiles-per-metre as the deck:
-      // U runs the cumulative arc length around the skirt, V is the vertical face.
-      // The ring closes with a single back seam at the wrap, which the wood's
-      // RepeatWrapping absorbs.
+      // UVs in METRES so the wood tiles at the same tiles-per-metre as the deck.
+      // U is the cumulative arc length around the ring, taken ONCE from the widest
+      // ring and reused for all of them: the rings are offsets of each other, so a
+      // shared U keeps the grain running in straight vertical lines instead of
+      // shearing as the perimeter shrinks. V is the cumulative distance DOWN the
+      // profile rather than the raw height, so the grain does not compress over the
+      // roll — a point moves by Δr laterally and Δy vertically between rings, and
+      // the surface distance is the hypotenuse. The ring closes with a single back
+      // seam at the wrap, which the wood's RepeatWrapping absorbs.
+      const widest = rings[arc90.length - 1].pts;
+      const uAt = [];
+      let arc = 0;
+      for (let i = 0; i < n; i++) {
+        if (i > 0) arc += Math.hypot(widest[i][0] - widest[i - 1][0], widest[i][1] - widest[i - 1][1]);
+        uAt.push(arc);
+      }
+
       const pos = [];
       const uv = [];
       const idx = [];
-      let arc = 0;
-      for (let i = 0; i < n; i++) {
-        if (i > 0) {
-          const dx = top[i][0] - top[i - 1][0], dz = top[i][1] - top[i - 1][1];
-          arc += Math.hypot(dx, dz);
+      let v = 0;
+      for (let k = 0; k < rings.length; k++) {
+        const ring = rings[k];
+        if (k > 0) {
+          const prev = rings[k - 1];
+          // Δr read off the straight sides, where the offset is the whole distance.
+          const dr = Math.hypot(ring.pts[0][0] - prev.pts[0][0], ring.pts[0][1] - prev.pts[0][1]);
+          v += Math.hypot(dr, ring.y - prev.y);
         }
-        pos.push(top[i][0], yTop, top[i][1]);
-        pos.push(bot[i][0], yBottom, bot[i][1]);
-        uv.push(arc, yTop);
-        uv.push(arc, yBottom);
+        for (let i = 0; i < n; i++) {
+          pos.push(ring.pts[i][0], ring.y, ring.pts[i][1]);
+          uv.push(uAt[i], v);
+        }
       }
-      for (let i = 0; i < n; i++) {
-        const a = 2 * i, b = a + 1;
-        const c = 2 * ((i + 1) % n), d = c + 1;   // wraps, closing the loop
-        idx.push(a, b, d, a, d, c);
+      for (let k = 0; k < rings.length - 1; k++) {
+        const row = k * n, next = (k + 1) * n;
+        for (let i = 0; i < n; i++) {
+          const j = (i + 1) % n;                 // wraps, closing the loop
+          idx.push(row + i, next + i, next + j, row + i, next + j, row + j);
+        }
       }
 
       const skirt = new THREE.BufferGeometry();
@@ -373,19 +520,18 @@ export function makeTableCabinet(tableW, tableH, opts = {}) {
       skirtMesh.receiveShadow = true;
       group.add(skirtMesh);
 
-      // --- deck ----------------------------------------------------------
-      // Outer edge is the skirt's own top ring, so the two meet exactly at yTop.
-      const deck = makePlanarMeshFromPolyline(
-        top,
-        deckThickness,
-        yTop - deckThickness / 2,
-        {
-          color, roughness, metalness: 0.0, wood: true,
-          holes: [table_top_outline(tableW, tableH)],
-          castShadow: true, receiveShadow: true,
-        },
-      );
-      group.add(deck);
+      // --- deck and floor -------------------------------------------------
+      // Each cap's outline IS the skirt ring at that height, so the three meet
+      // exactly with no seam to close. The deck now takes the bullnose's TOP ring,
+      // which the roll leaves tangent to it — the wood runs flat out to there and
+      // then turns over.
+      const face = { color, roughness, metalness: 0.0, wood: true, castShadow: true, receiveShadow: true };
+      group.add(makePlanarMeshFromPolyline(rings[0].pts, 0, yTop, {
+        ...face,
+        holes: [table_top_outline(tableW, tableH)],
+      }));
+      const bottom = rings[rings.length - 1];
+      group.add(makePlanarMeshFromPolyline(bottom.pts, 0, bottom.y, face));
 
       return group;
 }
@@ -412,6 +558,7 @@ export function makeTableSights(tableW, tableH, opts = {}) {
         halfLen = 0.013,      // point-to-point ACROSS the rail (~1 in tip to tip)
         halfWid = 0.0075,     // point-to-point ALONG the rail
         lift = 0.001,         // sit just proud of the wood so it can't z-fight
+        gap = 0.04,          // diamond CENTRE out from the rail's outer edge
       } = opts;
 
       const p = pocket_positions(tableW, tableH);
@@ -419,14 +566,24 @@ export function makeTableSights(tableW, tableH, opts = {}) {
       const cornerZ = Math.abs(p[0][1]);   // corner-pocket centre |z|  (short-rail ends)
 
       // Back from the nose onto the wood deck's flat. The deck's inner edge is the
-      // rail's outer edge (`inset` out from the nose); its outer edge is the
-      // cabinet's top section — cabinetRTop past the corner-pocket centres, which
-      // themselves sit (cornerX - tableW/2) out from the nose. Sit the sight a
-      // third of the way across, so it rides closer to the rail than the outer
-      // edge, the way a real inlaid diamond hugs the cushion.
+      // rail's outer edge, `inset` out from the nose, and `gap` rides the sight a
+      // FIXED distance further out from there — the way a real inlaid diamond hugs
+      // the cushion at a set offset regardless of how wide the rest of the cabinet
+      // is. It was once a fraction of the wood band's width, which meant retuning
+      // cabinetRTop silently walked all 18 diamonds toward or away from the rail.
+      //
+      // The flat it has to fit on runs out to the cabinet's top section —
+      // cabinetRTop past the corner-pocket centres, which themselves sit
+      // (cornerX - tableW/2) out from the nose — less cabinetEdgeR, where the
+      // bullnose starts rolling over. `gap + halfLen` must stay inside that, or the
+      // outer tip creeps onto the roll; the assert says so rather than leaving a
+      // subtly bent diamond to be spotted by eye.
       const woodInner = inset;
-      const woodOuter = (cornerX - tableW / 2) + cabinetRTop;
-      const setback = woodInner + (woodOuter - woodInner) / 3;
+      const woodOuter = (cornerX - tableW / 2) + cabinetRTop - cabinetEdgeR;
+      const setback = woodInner + gap;
+      if (setback + halfLen > woodOuter) {
+        throw new Error(`sight gap ${gap} runs off the wood flat (${(woodOuter - woodInner).toFixed(3)} m wide)`);
+      }
       const y = pocketWireY + lift;
 
       // Long rails: x at the quarter divisions between a corner pocket (|x|=cornerX)
@@ -553,8 +710,8 @@ export function makeCylindricalCupMesh(radius, height, opts = {}) {
   // Raised back. The rim sits below the felt, so from inside the table you look
   // straight over it, through the mouth and on into the cabinet — the wire and
   // the cup read as separated by a gap of nothing. Where the rim is OUTSIDE the
-  // table's top outline it has the wooden deck above it, so the wall can run up
-  // to the deck's underside and close that line of sight. Where it is inside the
+  // table's top outline it has the wire and the deck above it, so the wall can
+  // run up to `raiseTo` and close that line of sight. Where it is inside the
   // outline it must stay low: that is the mouth the ball drops through.
   //
   // The run ends where the cup circle crosses the outline, which is on the rail's

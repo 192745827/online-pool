@@ -67,7 +67,8 @@ src/                  Game code. Everything here except main.js and the *.view/
   sim.js              RoomSim: one authoritative simulation per room
   game.js             Generic two-player match controller (ruleset-agnostic)
   ai.js               Computer opponent (ghost-ball aiming, shot selection)
-  scene.js            Three renderer/scene/camera/lights
+  scene.js            Three renderer/scene/camera/lights + the quality presets
+  settings.js         Player options (reverse aim, graphics quality) — see §11
   cue.js              Cue stick mesh + orbit/top cameras + aim state (yaw/pitch/spin)
   input.js            Pointer-lock mouse/keyboard bindings
   hud.js              Sidebar HUD renderer (from gameState packets)
@@ -79,9 +80,17 @@ src/                  Game code. Everything here except main.js and the *.view/
     nineball.js       9-ball rules
     util.js           shuffle()
 
+test/
+  *.test.js           Pure-logic suites, no browser      (npm test)
+  browser/            Real Chrome, driven over CDP       (npm run test:browser)
+  perf/               Frame-time benchmarks, real GPU    (npm run perf:*) — §11
+
 lib/                  Vendored: three.module.js, ammo (browser wasm + node cjs),
                       schemapack.js, socketUtility.js, buffer shim
 ```
+
+> The `src/` tree above predates the `client/` `server/` `shared/` split and
+> lists flat paths; the file names are right, the directories are not.
 
 ---
 
@@ -147,11 +156,107 @@ SI units (metres, kg, seconds). The table lies in the XZ plane, Y is up:
   anything is sent to clients; accuracy comes from here) and then applies hand-rolled
   felt drag: linear deceleration `mu_felt_linear·g` on horizontal speed and a tapered
   decay on Y-axis (english) spin. Bullet's own rolling/spinning friction is disabled.
-- Balls use CCD (swept spheres) so break shots can't tunnel through cushions.
+- Balls use CCD (swept spheres) — not only against tunnelling, it is what makes the
+  ball-ball cut angle accurate. See **CCD** below; the three settings involved are
+  interlocking and none of them are free to tune.
 - `body.ptr` is a stable numeric pointer identity in both Ammo builds; the manifold
   scanner relies on `manifold.getBody0().ptr` matching it.
 
 **User indices** (debug labels): 1 = ball, 2 = rail, 3 = felt, 4 = pocket cup.
+
+### CCD (continuous collision detection) — do not retune these
+
+Three settings work as a unit. Changing any one of them in isolation breaks the
+others. All values below were measured against `lib/ammo.server.cjs` (Bullet ≥ 2.89)
+at `FIXED_DT = 4 ms`, `R = 0.028575`.
+
+```js
+// physics.js, createWorld()
+world.getDispatchInfo().set_m_allowedCcdPenetration(0);
+// balls.logic.js
+body.setCcdSweptSphereRadius(R - 0.001);
+body.setContactProcessingThreshold(0.);
+```
+
+**Why `m_allowedCcdPenetration(0)`.** Despite the name it is not a penetration depth.
+`btClosestNotMeConvexResultCallback::addSingleResult` compares it against
+`hitNormal · (to − from)` — the raw per-step **displacement in metres**. At Bullet's
+default of `0.04`, a CCD hit is discarded unless the ball moves 40 mm in one tick,
+i.e. **CCD is completely inert below 10 m/s** (`0.04 / 0.004`). Measured: zero
+clamping at 9 m/s, clamping at 10. Setting it to 0 is what turns CCD *on* at all.
+Without this line `setCcdSweptSphereRadius` does nothing.
+
+**Why the swept radius is exactly `R - 0.001`.** Bullet's sweep terminates its
+conservative-advancement loop at a **hardcoded 1 mm**, not at zero:
+
+```cpp
+// btContinuousConvexCollision.cpp:126
+btScalar radius = 0.001f;
+...
+while (dist > radius)          // line 148
+```
+
+It is absolute metres — no dependence on ball size, margin, or timestep — with no
+setter, no `#define`, and no way to reach it from Ammo. It has been unchanged since
+2006 (deleted once in 2011 and restored 40 minutes later: *"necessary for
+termination"*).
+
+The sweep casts a sphere of radius `R − e` against the other ball's real `R` shape,
+so the ball parks at a real overlap of `e − dist_exit` where `dist_exit ∈ [0, 1 mm]`.
+`e = 1 mm` is therefore the **smallest** value for which the parked state is always
+an overlap and never a gap:
+
+| `e` | parked real overlap |
+|---|---|
+| `0.001` (shipped) | `(0, 1 mm]` — always touching |
+| `0.000268` | `(−0.73 mm, 0.27 mm]` — **up to 0.73 mm apart** |
+
+Park the balls with a gap and the *next* tick's sweep starts already inside the 1 mm
+tolerance, so the loop never runs and the hit fraction comes back **0**. The ball is
+frozen for that tick, and `createPredictiveContacts` injects a manifold point at
+distance exactly 0 carrying `m_combinedRestitution = 0`
+(`btDiscreteDynamicsWorld.cpp:918`). Distance 0 passes the processing-threshold gate,
+so it *is* solved — and the collision comes out **perfectly inelastic**: object ball
+at half the closing speed, 48.7 % speed loss, exactly half the pair's kinetic energy
+destroyed with momentum still exact. This is the failure `test/conservation.test.js`
+catches. Roughly half of all tick phases fail this way, so the *average* loss at
+`R - 0.000268` is 20-29 %.
+
+The same sweep runs against the **felt**, so a sub-millimetre margin also freezes a
+merely rolling ball on about every other tick: measured travel drops to **50 % of
+correct** at `R - 0.000857`, with no collision involved at all.
+
+The cliff is sharp to within 50 µm — `e = 0.001000` shows zero failures,
+`e = 0.000950` already halves felt travel. Going the other way is safe but blunts
+accuracy: `0.9R` (the old value) triples the cut-angle spread, 1.70° vs 0.585°.
+
+**Why `setContactProcessingThreshold(0.)` is load-bearing.** It is what discards the
+zero-restitution predictive contacts described above in the normal case (their
+distance is *travel-to-impact*, a positive number, so the gate drops them and only
+the real elastic contact reaches the solver). At Bullet's default of `BT_LARGE_FLOAT`
+every predictive contact is admitted and *every* fast ball gets the inelastic catch —
+measured 0.465× the correct object-ball speed even with the 1 mm margin. Do **not**
+make it negative either: at `-1e-5` the ball wedges permanently, clamped at touch
+every tick with no contact ever admitted.
+
+**Non-issues, so nobody re-investigates them.** There is no minimum penetration
+anywhere on the response side: the impulse is bit-identical correct from 0.1 µm to
+30 mm of overlap. `m_linearSlop` is 0; restitution never decays (ball-ball manifolds
+are cleared every tick, so there is no warm starting and no contact lifetime); and
+sphere-sphere generates **no** contact at all at positive separation, so the
+0.99 mm contact-breaking threshold never gates ball-ball. That threshold happening to
+land near 1 mm for this ball radius is a coincidence — it scales with `R`, the CCD
+constant does not.
+
+**Ammo binding gotcha.** `si.set_m_splitImpulsePenetrationThreshold(-0.02)` in
+`createWorld` is a silent no-op that stores **0** — the field is bound as an integer
+and truncates toward zero (`set(-0.5) → 0`, `set(-1.7) → -1`). This is benign and in
+fact desirable (with the threshold at 0 the split-impulse branch always wins, so erp
+positional recovery never leaks into velocity at any depth, which is why accuracy is
+flat vs penetration). But it is fragile: an Ammo rebuild with a correctly typed float
+would restore an `erp2·pen/dt` velocity injection. `m_restitutionVelocityThreshold` on
+the next line *is* a real float. Round-trip any Ammo solver-info setter before
+trusting it.
 
 ---
 
@@ -327,6 +432,34 @@ Server → client:
   camera, cue hidden, input gated).
 - Disconnection tears the room down and notifies the opponent.
 
+### Spectators & the demo table (`watchDemo` in `server/index.js`)
+
+A room also carries `watchers`: connections with **no seat**. They receive every
+broadcast (`startGame` / `balls` / `gameState` / `shotAnim`, plus `aimState`, which
+seated players only get for their *opponent*) and can send nothing that reaches the
+game — every play handler requires `conn.room`, which a watcher does not have.
+
+The only room that has any is the **demo table**: two bots at full difficulty
+(`DEMO_SKILL = 100`) playing 8-ball forever, which the client renders as the main
+menu's background (`startWatching` in `main.js`, `body.menuBg` in `styles.css` — aim
+view, no UI, the panel translucent over it). Notes:
+
+- It is an *ordinary* room. One bot opens it with `createRoom`, the other fills it
+  with `joinRoom`; `startMatch` then fires on its own. Nothing about the game loop
+  knows it is a demo.
+- One room serves every menu on the server, not one sim per open tab.
+- A watcher joining mid-rack gets `sendSnapshot`: `startInfo()` reports the balls
+  *still in play at their current positions*, so it builds what is on the felt rather
+  than a fresh rack. There is no backlog — unlike a resuming player, a watcher has
+  missed nothing it is owed.
+- `room.demo` drives `maybeRerack`: a finished rack starts itself over, scheduled off
+  `replayUntil` so the winning shot has played out first.
+- Entering any real room (`createRoom` / `joinRoom` / `quickPlay` / `playBot` /
+  `resume`) detaches the watcher server-side; on the client, `roomJoined` is the one
+  place that clears it. `DEMO_IDLE_MS` after the last watcher leaves, the table is
+  torn down — idle it costs only timers, but a bot pair simulates a shot to rest every
+  couple of seconds, which is real work to do for an empty gallery.
+
 ---
 
 ## 8. The computer opponent (`src/ai.js` + `tickBot` in `server/index.js`)
@@ -408,9 +541,11 @@ trigger, so all rules/physics apply to it identically.
       (`KICK_CLEAR = 1.35×`) and the bounce point must stay off pocket mouths;
    3. the least-bad scratch-risky direct hit, played gently;
    4. a hopeful poke at the nearest legal ball.
-6. **Fallbacks**: on the break, smash the nearest legal ball at full power; with
-   nothing open, poke the nearest (preferably reachable) legal ball at low power as a
-   safety.
+6. **Fallbacks**: on the break, smash the nearest legal ball (the apex) at full power
+   and *dead straight* — the break takes no aim jitter at any difficulty, since there
+   is no pot to miss and a sloppy angle only shrinks the spread; variety comes from
+   the cue-ball placement and the rack's own ~1 mm jitter. With nothing open, poke the
+   nearest (preferably reachable) legal ball at low power as a safety.
 
 `computeBotPlacement(sim)` (ball-in-hand) tries straight-in lineups behind each pot
 line's ghost ball at a few distances, plus up to 64 random in-bounds spots, and of the
@@ -449,8 +584,13 @@ game finishes.
   turn it drives cue.js from the streamed `opponentAim` and switches to the overhead
   camera. Ball-in-hand moves are sent as deltas scaled by `PLACE_SCALE` and echoed
   back via `placing`.
-- **scene.js** — renderer, camera, three shadow-casting directional lights; resizes
-  with the canvas.
+- **scene.js** — renderer, both cameras, and the light rig: three overhead spot
+  lamps down the long axis plus four grazing directional fills, over a hemisphere
+  and an ambient. Resizes with the canvas, and owns everything the quality preset
+  does to the renderer and the lights (`applyQuality`) — see §11.
+- **settings.js** — the two player options (reverse aim, graphics quality),
+  persisted in `localStorage` and pushed live to the three modules holding GPU
+  resources (`scene.js`, `geometry.js`, `balls.view.js`). See §11.
 - **cue.js** — all aim state (yaw/pitch/strike/pullback) plus the stick mesh and both
   cameras. The orbit camera anchors to the cue ball's position at aim time and offsets
   its sightline to stay above/beside the stick even with english or an elevated cue;
@@ -496,7 +636,121 @@ game finishes.
 
 ---
 
-## 11. Common extension points
+## 11. Graphics quality & performance
+
+Two player options live in the ≡ menu (`src/client/settings.js`): **reverse aim**
+and a five-notch **graphics quality** slider. Both persist per-device in
+`localStorage` and apply live — no reload, no new game, safe to change mid-replay.
+
+### The ladder
+
+Measured on an M5 through headless Chrome (ANGLE/Metal), 1400x900 CSS at
+devicePixelRatio 3 — a 4200x2700 backing store, which is the retina case the
+presets exist for. Vsync off, both sweep directions, better median kept.
+
+| # | Preset  | Frame  | fps | Side lights lit | Side lights cast | Lamps casting |
+|---|---------|--------|-----|-----------------|------------------|---------------|
+| 0 | Minimum |  3.3ms | 303 | –               | –                | 0             |
+| 1 | Low     |  5.4ms | 185 | –               | –                | 1             |
+| 2 | Medium  |  8.0ms | 125 | yes             | –                | 1             |
+| 3 | High ←default | 11.9ms | 84 | yes        | –                | 3             |
+| 4 | Ultra   | 17.4ms |  57 | yes             | yes              | 3             |
+
+Ultra is what the table rendered unconditionally before the slider existed. The
+default is High because Ultra's side-light shadows alone cost ~5.3 ms and are
+what drop a full-screen retina window under 60 fps.
+
+### What actually costs anything
+
+From `npm run perf:ablate` — each feature toggled off-then-on back to back,
+median of 3 paired differences, in two different base scenes:
+
+| feature | lean scene | loaded scene |
+|---|---|---|
+| side lights **cast** | +6.20 ms | +5.30 ms |
+| shadows at all (first lamp) | +1.90 ms | n/a\* |
+| lamps casting 1 → 3 | +1.80 ms | +0.60 ms |
+| side lights **lit** | +1.40 ms | +0.80 ms |
+| *— noise floor ≈0.5 ms —* | | |
+| normal map | +0.20 | +0.60 |
+| roughness map | +0.20 | +0.20 |
+| ball mesh 24 → 64 segs | +0.10 | +0.40 |
+| soft PCF vs hard filter | 0.00 | −1.00 |
+| shadow map 512 → 2048 | 0.00 | −0.20 |
+| anisotropy 1 → 16 | 0.00 | +0.20 |
+| ball texture 256 → 1024 | 0.00 | +0.20 |
+| scanned textures 512 → 4K | −0.20 | −1.60 |
+
+\* in the loaded scene the side lights already cast, so switching shadows off
+kills all five maps at once (+8.6 ms) instead of isolating the one lamp.
+
+**The entire budget is shadows and light count.** Nothing else clears the noise
+floor, which is why the ladder moves exactly four things. Two consequences worth
+keeping in mind:
+
+- **Every light shades every fragment, cast or not.** A lit-but-not-casting light
+  still runs a full diffuse + GGX specular evaluation per pixel. Unlighting the
+  four side fills takes the rig from 9 lights to 5. What you *see* go away is one
+  specular highlight per ball — seven dots become three — plus the lift on the
+  cabinet's outward faces, which falls back on the ambient.
+- **Shadow cost is per-pixel, so it grows with resolution.** The side lights'
+  shadows cost 1.26x at dpr 1 but 1.6x at dpr 3. Shadow-shaped things get *more*
+  expensive on exactly the displays most likely to need help.
+
+### What is pinned, and why
+
+The soft PCF filter, 2048 shadow maps, anisotropy 16, and the roughness map are
+**not dials** — all measured free, so degrading them would cost image quality and
+buy zero milliseconds. An earlier cut of these presets dialled all four; that is
+the worst trade available and the ablation exists to prevent it recurring.
+
+Three settings stay tiered despite being free in frame time, for reasons that are
+*not* frame time — keep the distinction when retuning:
+
+| setting | real resource | scale |
+|---|---|---|
+| `texMax` | **VRAM** | five scanned maps ≈380 MB decoded+mipmapped at 4K, ≈28 MB at 1K. An OOM on a phone, not a slow frame. |
+| `normalMap` | **download** | `felt/normal.png` is 11 MB; dropping the slot is the only lever here that avoids a fetch at all. |
+| `ballSegs` | vertex throughput | free on desktop (+0.4 ms), but 16 spheres × 7 shadow passes may not be on weak mobile. |
+
+`texMax` does **not** save download — files are fetched at full size and shrunk
+after decode, because there is one file per map on disk.
+
+### Resolution is deliberately not a dial
+
+It is the single largest lever available: an earlier cut capped pixel ratio per
+level and that cap alone outweighed every other setting combined (Medium ran
+1.0 ms against High's 6.0 on a dpr-3 display, almost all of it 1.5x pixels vs
+2x). Every preset now renders at the display's full `devicePixelRatio`
+(`scene.js` `fitCanvas`, and `hudCanvas.js` matches it). Resolution buys
+sharpness in everything at once and is what the eye reads first; the slider
+spends its budget elsewhere. A trade you can look at and accept is fine, a soft
+image is not.
+
+### Re-running the measurements
+
+```bash
+npm run perf:ablate     # per-feature marginal cost  (~20 min)
+npm run perf:presets    # is the ladder well spaced? (~8 min)
+```
+
+Both need real Chrome (`CHROME=` to override the path) and drive the actual
+client via `window.__gfxSet`, which pushes an arbitrary set of preset fields
+through the same path the slider uses. Two methodology traps, both of which
+produced confidently wrong numbers before being fixed — see the header comments
+in `test/perf/ablate.mjs`:
+
+1. **Measure in pairs.** One baseline compared against many features lets thermal
+   drift land on the features as fake cost; it reported anisotropy at 3.2 ms.
+2. **Use a base where the feature can act.** Adding "soft shadows" onto a base
+   with renderer shadows off changes nothing. Those rows came back *negative*,
+   which is the tell that you are measuring noise.
+
+Do not run anything else GPU-heavy alongside these.
+
+---
+
+## 12. Common extension points
 
 | Want to… | Touch |
 |---|---|
